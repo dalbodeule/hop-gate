@@ -1,0 +1,96 @@
+HopGate System Architecture Diagram Instruction
+
+Please draw a clean, modern system architecture diagram for a project called "HopGate".
+
+=== High-level concept ===
+- HopGate is a reverse HTTP gateway.
+- A single public server terminates HTTPS and DTLS, and tunnels HTTP traffic to multiple clients.
+- Each client runs in a private network and forwards HTTP requests to local services (127.0.0.1:PORT).
+
+=== Main components to draw ===
+1) External Users / Browsers
+   - Icon group labeled "External Users / Browsers"
+   - They send HTTPS requests like https://proxy.example.com/service-a/path
+
+2) HopGate Server (Public Edge)
+   - Big box titled "HopGate Server (Public Edge)"
+   - Inside this box, draw and label sub-components:
+     a. "HTTPS Listener (TCP 443)"
+        - Terminates TLS using ACME certificates for main and proxy domains.
+     b. "HTTP Listener (TCP 80)"
+        - Handles ACME HTTP-01 challenges and redirects HTTP to HTTPS.
+     c. "DTLS Listener (UDP 443 or 8443)"
+        - Terminates DTLS sessions from multiple clients.
+     d. "Admin API / Management Plane"
+        - REST API base path: /api/v1/admin
+        - Endpoints:
+          - POST /domains/register
+          - POST /domains/unregister
+        - Uses "Admin API Key" via header Authorization: Bearer <key>.
+     e. "Reverse Proxy Core"
+        - Routes incoming HTTP(S) requests to the correct client based on domain and path.
+     f. "ACME Certificate Manager"
+        - Automatically issues and renews TLS certificates (Let's Encrypt).
+     g. "DTLS Session Manager"
+        - Manages DTLS connections and per-domain sessions with clients.
+     h. "Metrics & Logging"
+        - Structured JSON logs shipped to Prometheus / Loki / Grafana stack.
+
+3) Database Layer
+   - Box labeled "PostgreSQL + ent ORM"
+   - Connected to the Admin API / Management Plane.
+   - Stores "Domain" entities:
+     - UUID id
+     - domain (FQDN)
+     - client_api_key (64 chars)
+     - memo
+     - timestamps
+
+4) HopGate Clients (Private Networks)
+   - Draw 2–3 separate client boxes to show that multiple clients can connect.
+   - Each box titled "HopGate Client".
+   - Inside each client box, show:
+     a. "DTLS Client"
+        - Connects to HopGate Server via DTLS.
+        - Performs handshake with:
+          - domain
+          - client_api_key
+     b. "Client Proxy"
+        - Receives HTTP requests from the server over DTLS.
+        - Forwards them to local services such as:
+          - 127.0.0.1:8080 (web)
+          - 127.0.0.1:9000 (admin)
+     c. "Local Services"
+        - A small group of boxes representing local HTTP servers.
+
+=== Flows to highlight ===
+1) User HTTP Flow
+   - External user -> HTTPS Listener -> Reverse Proxy Core -> DTLS Session Manager -> Specific HopGate Client -> Local Service -> back through same path to the user.
+
+2) Admin Flow
+   - Administrator -> Admin API (with Bearer admin key) -> PostgreSQL + ent ORM:
+     - Register domain + memo -> returns client_api_key.
+     - Unregister domain + client_api_key.
+
+3) DTLS Handshake Flow
+   - From client to server over DTLS:
+     - Client sends {domain, client_api_key}.
+     - Server validates against PostgreSQL Domain table.
+     - On success, both sides log:
+       - server: which domain is bound to the session.
+       - client: success message, bound domain, and local_target (local service address).
+
+=== Visual style ===
+- Clean flat design, no 3D.
+- Use distinct colors for:
+  - public zone (internet + HopGate Server),
+  - database,
+  - each client / private network.
+- Ensure labels are readable and precise.
+- The overall layout should clearly show:
+  - Internet (top or left),
+  - HopGate Server in the center,
+  - Database near the server,
+  - Multiple clients and their local services on the right or bottom.
+
+Please output a single high-resolution architecture diagram that matches this description.
