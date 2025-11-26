@@ -3,8 +3,6 @@
 이 문서는 git-rewrite-commits(node 기반 도구)가 참고하는 **커밋 메시지 형식 규칙**을 정의합니다.  
 This document defines the **commit message format** used by the node-based tool git-rewrite-commits.
 
-파일 위치: [`COMMIT_MESSAGE.md`](COMMIT_MESSAGE.md:1)
-
 ---
 
 ## 1. 기본 형식 (Basic Format)
