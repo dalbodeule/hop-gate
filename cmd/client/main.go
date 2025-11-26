@@ -1,16 +1,134 @@
 package main
 
 import (
+	"context"
+	"crypto/tls"
+	"flag"
+	"os"
+	"strings"
+
+	"github.com/dalbodeule/hop-gate/internal/config"
+	"github.com/dalbodeule/hop-gate/internal/dtls"
 	"github.com/dalbodeule/hop-gate/internal/logging"
 )
 
+// maskAPIKey 는 로그에 노출할 때 클라이언트 API Key 를 일부만 보여주기 위한 헬퍼입니다.
+func maskAPIKey(key string) string {
+	if len(key) <= 8 {
+		return "***"
+	}
+	return key[:4] + "..." + key[len(key)-4:]
+}
+
+// firstNonEmpty 는 앞에서부터 처음으로 non-empty 인 문자열을 반환합니다.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 func main() {
 	logger := logging.NewStdJSONLogger("client")
+
+	// CLI 인자 정의 (env 보다 우선 적용됨)
+	serverAddrFlag := flag.String("server-addr", "", "DTLS server address (host:port)")
+	domainFlag := flag.String("domain", "", "registered domain (e.g. api.example.com)")
+	apiKeyFlag := flag.String("api-key", "", "client API key for the domain (64 chars)")
+	localTargetFlag := flag.String("local-target", "", "local HTTP target (host:port), e.g. 127.0.0.1:8080")
+
+	flag.Parse()
+
+	// 1. 환경변수(.env 포함)에서 클라이언트 설정 로드
+	envCfg, err := config.LoadClientConfigFromEnv()
+	if err != nil {
+		logger.Error("failed to load client config from env", logging.Fields{
+			"error": err.Error(),
+		})
+		os.Exit(1)
+	}
+
+	// 2. CLI 인자 우선, env 후순위로 최종 설정 구성
+	finalCfg := &config.ClientConfig{
+		ServerAddr:   firstNonEmpty(strings.TrimSpace(*serverAddrFlag), strings.TrimSpace(envCfg.ServerAddr)),
+		Domain:       firstNonEmpty(strings.TrimSpace(*domainFlag), strings.TrimSpace(envCfg.Domain)),
+		ClientAPIKey: firstNonEmpty(strings.TrimSpace(*apiKeyFlag), strings.TrimSpace(envCfg.ClientAPIKey)),
+		LocalTarget:  firstNonEmpty(strings.TrimSpace(*localTargetFlag), strings.TrimSpace(envCfg.LocalTarget)),
+		Debug:        envCfg.Debug,
+		Logging:      envCfg.Logging,
+	}
+
+	// 3. 필수 필드 검증
+	missing := []string{}
+	if finalCfg.ServerAddr == "" {
+		missing = append(missing, "server_addr")
+	}
+	if finalCfg.Domain == "" {
+		missing = append(missing, "domain")
+	}
+	if finalCfg.ClientAPIKey == "" {
+		missing = append(missing, "api_key")
+	}
+	if finalCfg.LocalTarget == "" {
+		missing = append(missing, "local_target")
+	}
+
+	if len(missing) > 0 {
+		logger.Error("client config missing required fields", logging.Fields{
+			"missing": missing,
+		})
+		os.Exit(1)
+	}
+
 	logger.Info("hop-gate client starting", logging.Fields{
-		"stack": "prometheus-loki-grafana",
+		"stack":                 "prometheus-loki-grafana",
+		"server_addr":           finalCfg.ServerAddr,
+		"domain":                finalCfg.Domain,
+		"local_target":          finalCfg.LocalTarget,
+		"client_api_key_masked": maskAPIKey(finalCfg.ClientAPIKey),
+		"debug":                 finalCfg.Debug,
 	})
-	// TODO: load configuration from internal/config
-	// TODO: initialize logging details (instance, env, version) via logger.With(...)
-	// TODO: establish DTLS connection to server via internal/dtls
-	// TODO: start request handling loop using internal/proxy and internal/protocol
+
+	// 4. DTLS 클라이언트 연결 및 핸드셰이크
+	ctx := context.Background()
+
+	// 디버그 모드에서는 서버 인증서 검증을 스킵(InsecureSkipVerify=true) 하여
+	// self-signed 테스트 인증서도 신뢰하도록 합니다.
+	// 운영 환경에서는 Debug=false 로 두고, 올바른 RootCAs / ServerName 을 갖는 tls.Config 를 사용해야 합니다.
+	var tlsCfg *tls.Config
+	if finalCfg.Debug {
+		tlsCfg = &tls.Config{
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS12,
+		}
+	}
+
+	client := dtls.NewPionClient(dtls.PionClientConfig{
+		Addr:      finalCfg.ServerAddr,
+		TLSConfig: tlsCfg,
+	})
+
+	sess, err := client.Connect()
+	if err != nil {
+		logger.Error("failed to establish dtls session", logging.Fields{
+			"error": err.Error(),
+		})
+		os.Exit(1)
+	}
+	defer sess.Close()
+
+	hsRes, err := dtls.PerformClientHandshake(ctx, sess, logger, finalCfg.Domain, finalCfg.ClientAPIKey, finalCfg.LocalTarget)
+	if err != nil {
+		logger.Error("dtls handshake failed", logging.Fields{
+			"error": err.Error(),
+		})
+		os.Exit(1)
+	}
+
+	logger.Info("dtls handshake completed", logging.Fields{
+		"domain":       hsRes.Domain,
+		"local_target": finalCfg.LocalTarget,
+	})
 }

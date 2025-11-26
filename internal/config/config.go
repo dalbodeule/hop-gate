@@ -33,16 +33,26 @@ type ServerConfig struct {
 	DTLSListen   string   // 예: ":443"
 	Domain       string   // 메인 도메인
 	ProxyDomains []string // 프록시 서브도메인 또는 별도 도메인
+	Debug        bool     // true 이면 디버그 모드 (예: self-signed 인증서 신뢰, 검증 스킵 등)
 
 	Logging LoggingConfig // 서버용 로그 설정
 }
 
 // ClientConfig 는 클라이언트 프로세스 설정을 담습니다.
+// 현재 클라이언트는 다음 4가지 설정만 사용합니다.
+//   - ServerAddr   : DTLS 서버 주소 (host:port)
+//   - Domain       : 서버에서 등록된 도메인 (예: api.example.com)
+//   - ClientAPIKey : 도메인에 매핑된 64자 클라이언트 API Key
+//   - LocalTarget  : 로컬에서 요청할 서버 주소 (예: 127.0.0.1:8080)
+//
+// 값은 .env/환경변수와 CLI 인자를 조합해 구성하며,
+// CLI 인자가 우선, env 가 후순위로 적용됩니다.
 type ClientConfig struct {
-	ServerAddr   string            // DTLS 서버 주소 (host:port)
-	ClientID     string            // 클라이언트 식별자
-	AuthToken    string            // 선택적 인증 토큰
-	ServicePorts map[string]string // service name -> "127.0.0.1:PORT"
+	ServerAddr   string // DTLS 서버 주소 (host:port)
+	Domain       string // 서버에서 등록된 도메인 (예: api.example.com)
+	ClientAPIKey string // 도메인에 매핑된 64자 클라이언트 API Key
+	LocalTarget  string // 로컬에서 요청할 서버 주소 (예: 127.0.0.1:8080)
+	Debug        bool   // true 이면 디버그 모드 (예: 서버 인증서 검증 스킵 등)
 
 	Logging LoggingConfig // 클라이언트용 로그 설정
 }
@@ -212,12 +222,14 @@ func LoadServerConfigFromEnv() (*ServerConfig, error) {
 		DTLSListen:   getEnvOrDefault("HOP_SERVER_DTLS_LISTEN", ":443"),
 		Domain:       os.Getenv("HOP_SERVER_DOMAIN"),
 		ProxyDomains: parseCSVEnv("HOP_SERVER_PROXY_DOMAINS"),
+		Debug:        getEnvBool("HOP_SERVER_DEBUG", false),
 		Logging:      loadLoggingFromEnv(),
 	}
 	return cfg, nil
 }
 
 // LoadClientConfigFromEnv 는 .env 를 우선 읽고, 이후 환경 변수를 기반으로 클라이언트 설정을 구성합니다.
+// 실제 런타임에서 사용되는 필드는 ServerAddr, Domain, ClientAPIKey, LocalTarget 입니다.
 func LoadClientConfigFromEnv() (*ClientConfig, error) {
 	loadDotEnvOnce()
 	if dotenvErr != nil {
@@ -226,9 +238,10 @@ func LoadClientConfigFromEnv() (*ClientConfig, error) {
 
 	cfg := &ClientConfig{
 		ServerAddr:   os.Getenv("HOP_CLIENT_SERVER_ADDR"),
-		ClientID:     os.Getenv("HOP_CLIENT_ID"),
-		AuthToken:    os.Getenv("HOP_CLIENT_AUTH_TOKEN"),
-		ServicePorts: parseServicePortsEnv("HOP_CLIENT_SERVICE_PORTS"),
+		Domain:       os.Getenv("HOP_CLIENT_DOMAIN"),
+		ClientAPIKey: os.Getenv("HOP_CLIENT_API_KEY"),
+		LocalTarget:  os.Getenv("HOP_CLIENT_LOCAL_TARGET"),
+		Debug:        getEnvBool("HOP_CLIENT_DEBUG", false),
 		Logging:      loadLoggingFromEnv(),
 	}
 	return cfg, nil

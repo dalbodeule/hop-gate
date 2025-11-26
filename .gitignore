@@ -190,3 +190,6 @@ $RECYCLE.BIN/
 *.lnk
 
 # End of https://www.toptal.com/developers/gitignore/api/go,goland+all,dotenv,macos,linux,windows
+
+# builded binary
+bin/
