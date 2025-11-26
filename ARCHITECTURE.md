@@ -181,26 +181,26 @@ This document describes the overall architecture of the HopGate system. (en)
 
 ## 3. Request Flow Summary / 요청 흐름 요약
 
-1. 외부 사용자가 `https://proxy.example.com/service-a/path` 로 HTTPS 요청을 보냅니다. (ko)  
-1. An external user sends an HTTPS request to `https://proxy.example.com/service-a/path`. (en)
+1. 외부 사용자가 `https://proxy.example.com/service-a/path` 로 HTTPS 요청을 보냅니다. (ko)
+An external user sends an HTTPS request to `https://proxy.example.com/service-a/path`. (en)
 
 2. HopGate 서버의 HTTPS 리스너가 요청을 수신합니다. (ko)  
-2. The HTTPS listener on the HopGate server receives the request. (en)
+The HTTPS listener on the HopGate server receives the request. (en)
 
 3. `proxy` 레이어가 도메인과 경로를 기반으로 이 요청을 처리할 클라이언트(예: client-1)와 해당 로컬 서비스(`service-a`)를 결정합니다. (ko)  
-3. The `proxy` layer decides which client (e.g., client-1) and which local service (`service-a`) should handle the request, based on domain and path. (en)
+The `proxy` layer decides which client (e.g., client-1) and which local service (`service-a`) should handle the request, based on domain and path. (en)
 
 4. 서버는 요청을 `protocol.Request` 구조로 직렬화하고, `dtls.Session` 을 통해 선택된 클라이언트로 전송합니다. (ko)  
-4. The server serializes the request into a `protocol.Request` and sends it to the selected client over a `dtls.Session`. (en)
+The server serializes the request into a `protocol.Request` and sends it to the selected client over a `dtls.Session`. (en)
 
 5. 클라이언트의 `proxy` 레이어는 `protocol.Request` 를 수신하고, 로컬 서비스(예: 127.0.0.1:8080)에 HTTP 요청을 수행합니다. (ko)  
-5. The client’s `proxy` layer receives the `protocol.Request` and performs an HTTP request to a local service (e.g., 127.0.0.1:8080). (en)
+The client’s `proxy` layer receives the `protocol.Request` and performs an HTTP request to a local service (e.g., 127.0.0.1:8080). (en)
 
 6. 클라이언트는 로컬 서비스로부터 HTTP 응답을 수신하고, 이를 `protocol.Response` 로 직렬화하여 DTLS 채널을 통해 서버로 다시 전송합니다. (ko)  
-6. The client receives the HTTP response from the local service, serializes it as a `protocol.Response`, and sends it back to the server over DTLS. (en)
+The client receives the HTTP response from the local service, serializes it as a `protocol.Response`, and sends it back to the server over DTLS. (en)
 
 7. 서버는 `protocol.Response` 를 디코딩하여 원래의 HTTPS 요청에 대한 HTTP 응답으로 변환한 뒤, 외부 사용자에게 반환합니다. (ko)  
-7. The server decodes the `protocol.Response`, converts it back into an HTTP response, and returns it to the original external user. (en)
+The server decodes the `protocol.Response`, converts it back into an HTTP response, and returns it to the original external user. (en)
 
 ![architecture.jpeg](images/architecture.jpeg)
 
