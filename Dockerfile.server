@@ -1,0 +1,53 @@
+# Multi-stage Dockerfile for hop-gate server
+#
+# 빌드 단계와 런타임 단계를 분리한 기본 Dockerfile 입니다.
+# 최종 이미지는 경량 alpine 기반이며, /app 디렉터리에서 서버를 실행합니다.
+#
+# 빌드:
+#   docker build -f Dockerfile.server -t hop-gate-server:dev .
+#
+# 실행 예:
+#   docker run --rm -p 80:80 -p 443:443 \\
+#     --env-file ./.env \\
+#     hop-gate-server:dev
+
+# ---------- Build stage ----------
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /src
+
+# 모듈/의존성 캐시를 최대한 활용하기 위해 go.mod, go.sum 먼저 복사
+COPY go.mod ./
+# go.sum 이 있다면 같이 복사 (없으면 무시)
+# hadolint ignore=DL3059
+RUN if [ -f go.sum ]; then cp go.sum ./; fi
+
+RUN go env -w GOPROXY=https://proxy.golang.org,direct
+
+RUN go mod download || true
+
+# 실제 소스 코드 복사
+COPY . .
+
+# 서버 바이너리 빌드
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/hop-gate-server ./cmd/server
+
+# ---------- Runtime stage ----------
+FROM alpine:3.20
+
+WORKDIR /app
+
+# ca-certificates 설치 (ACME / HTTPS 통신 등을 위해 필요)
+RUN apk add --no-cache ca-certificates tzdata
+
+# 서버 바이너리 복사
+COPY --from=builder /out/hop-gate-server /app/hop-gate-server
+
+# 예시용 .env 파일도 같이 복사 (실운영에서는 보통 외부에서 마운트하거나 --env-file 사용)
+COPY .env.example /app/.env.example
+
+# 기본 포트 노출 (실제 포트는 .env / 설정에 따라 변경 가능)
+EXPOSE 80 443/udp 443
+
+# 기본 실행 명령
+ENTRYPOINT ["/app/hop-gate-server"]
