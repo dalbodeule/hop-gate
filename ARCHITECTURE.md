@@ -1,139 +1,230 @@
-# hop-gate 아키텍처 개요
+# HopGate Architecture / HopGate 아키텍처
 
-이 프로젝트는 인터넷에서 들어오는 HTTP(S) 트래픽을 여러 클라이언트로 터널링해 주는 게이트웨이(서버)와, 서버의 지시에 따라 로컬 네트워크에 HTTP 요청을 수행하는 클라이언트로 구성된다.
+이 문서는 HopGate 시스템의 전체 구조를 설명합니다. (ko)  
+This document describes the overall architecture of the HopGate system. (en)
 
-## 전체 구조
+---
 
-- 단일 Go 모듈: `hop-gate`
-- 실행 바이너리 2개:
-  - 서버: 공인 포트 80/443 점유, ACME로 인증서 자동 발급/갱신, HTTP Reverse Proxy 및 DTLS 터널 엔드포인트
-  - 클라이언트: DTLS를 통해 서버에 접속, 서버가 전달한 HTTP 요청을 로컬에서 실행 후 응답을 서버로 전달
+## 1. Overview / 전체 개요
 
-## 디렉터리 레이아웃
+- HopGate는 공인 서버와 여러 프라이빗 네트워크 클라이언트 사이에서 HTTP(S) 트래픽을 터널링하는 게이트웨이입니다. (ko)  
+- HopGate is a gateway that tunnels HTTP(S) traffic between a public server and multiple private-network clients. (en)
+
+- 서버는 80/443 포트를 점유하고, ACME(Let's Encrypt 등)로 TLS 인증서를 자동 발급/갱신합니다. (ko)  
+- The server listens on ports 80/443 and automatically issues/renews TLS certificates using ACME (e.g. Let's Encrypt). (en)
+
+- 클라이언트는 DTLS를 통해 서버에 연결되고, 서버가 전달한 HTTP 요청을 로컬 서비스(127.0.0.1:PORT)에 대신 보내고 응답을 다시 서버로 전달합니다. (ko)  
+- Clients connect to the server via DTLS, forward HTTP requests to local services (127.0.0.1:PORT), and send the responses back to the server. (en)
+
+- 관리 Plane(REST API)을 통해 도메인 등록/해제 및 클라이언트 API Key 발급을 수행합니다. (ko)  
+- An admin plane (REST API) is used to register/unregister domains and issue client API keys. (en)
+
+---
+
+## 2. Directory Layout / 디렉터리 레이아웃
 
 ```text
 .
 ├── cmd/
-│   ├── server/              # 서버 바이너리 엔트리 포인트
-│   └── client/              # 클라이언트 바이너리 엔트리 포인트
+│   ├── server/              # server binary entrypoint
+│   └── client/              # client binary entrypoint
 ├── internal/
-│   ├── config/              # 서버/클라이언트 공통 설정 로딩
-│   ├── acme/                # ACME(예: Let's Encrypt) 인증서 발급/갱신 로직
-│   ├── dtls/                # DTLS 세션 관리 및 암호화 채널 추상화
-│   ├── proxy/               # HTTP Proxy / 터널링 코어 로직
-│   ├── protocol/            # 서버-클라이언트 메시지 프로토콜 정의
-│   └── logging/             # 공통 로깅 유틸
+│   ├── config/              # shared configuration loader
+│   ├── acme/                # ACME certificate management
+│   ├── dtls/                # DTLS abstraction & implementation
+│   ├── proxy/               # HTTP proxy / tunneling core
+│   ├── protocol/            # server-client message protocol
+│   ├── admin/               # admin plane HTTP handlers
+│   └── logging/             # structured logging utilities
+├── ent/
+│   └── schema/              # ent schema definitions (e.g. Domain)
 └── pkg/
-    └── util/                # 재사용 가능한 유틸리티 (선택 사항)
+    └── util/                # reusable helpers (optional)
 ```
 
-### cmd/
+---
 
-- [`cmd/server/main.go`](cmd/server/main.go)
-  - 서버 설정 로딩 (리스닝 주소, ACME 도메인, Proxy 라우팅 설정 등)
-  - ACME 매니저 초기화 및 인증서 자동 관리
-  - HTTP(80) → ACME HTTP-01 챌린지 및 80 리다이렉트 처리
-  - HTTPS(443/TCP) → 외부 클라이언트의 HTTP(S) 요청 수신
-  - 443/UDP(또는 별도 포트) → DTLS 서버 소켓 생성
-  - DTLS 세션과 HTTP Proxy 코어를 연결
+### 2.1 `cmd/`
 
-- [`cmd/client/main.go`](cmd/client/main.go)
-  - 클라이언트 설정 로딩 (접속할 서버 주소, 인증 정보, 로컬 HTTP 타깃 포트 매핑 등)
-  - DTLS 클라이언트 세션 생성 및 재접속 로직
-  - 서버에서 내려오는 HTTP 요청 메시지를 받아 로컬 HTTP 서버/서비스로 프록시
-  - HTTP 응답을 서버로 전송
+- [`cmd/server/main.go`](cmd/server/main.go) — 서버 실행 엔트리 포인트. 서버 설정 로딩, ACME/TLS 초기화, HTTP/HTTPS/DTLS 리스너 시작을 담당합니다. (ko)  
+- [`cmd/server/main.go`](cmd/server/main.go) — Server entrypoint. Loads configuration, initializes ACME/TLS, and starts HTTP/HTTPS/DTLS listeners. (en)
 
-### internal/config
+- [`cmd/client/main.go`](cmd/client/main.go) — 클라이언트 실행 엔트리 포인트. 설정 로딩, DTLS 연결 및 핸드셰이크, 로컬 서비스 프록시 루프를 담당합니다. (ko)  
+- [`cmd/client/main.go`](cmd/client/main.go) — Client entrypoint. Loads configuration, performs DTLS connection and handshake, and runs the local proxy loop. (en)
 
-서버와 클라이언트가 공통으로 사용하는 설정 스키마를 정의한다.
+---
 
-- 서버 설정 예시
-  - 리스닝 주소: `http_listen`, `https_listen`, `dtls_listen`
-  - ACME 설정: `acme_email`, `acme_ca`, `acme_cache_dir`
-  - 도메인/서브도메인: 메인 도메인, 프록시 서브도메인 목록
-  - 라우팅 규칙: 도메인/패스 → 클라이언트 ID 매핑
-- 클라이언트 설정 예시
-  - 서버 주소 및 포트 (DTLS)
-  - 클라이언트 식별자 및 인증 토큰/키
-  - 로컬 HTTP 타깃 매핑: `service_name` → `127.0.0.1:PORT`
+### 2.2 `internal/config`
 
-### internal/acme
+- 서버와 클라이언트가 공통으로 사용하는 설정 스키마 및 `.env`/환경 변수 로더를 제공합니다. (ko)  
+- Provides shared config structs for server and client, plus `.env`/environment variable loaders. (en)
 
-- ACME 클라이언트 래퍼
-- 메인 도메인 및 Proxy 서브도메인(또는 별도 정의 도메인)용 인증서 발급
-- HTTP-01 또는 TLS-ALPN-01 챌린지를 위한 훅 제공
-- 자동 갱신 및 인증서 캐시(파일 또는 디렉터리) 관리
+- 주요 구조체 / Main structs: (ko/en)  
+  - `ServerConfig` — HTTP/HTTPS/DTLS 리스닝 주소, 도메인/프록시 도메인, Debug 플래그, 로그 설정. (ko)  
+  - `ServerConfig` — HTTP/HTTPS/DTLS listen addresses, main/proxy domains, debug flag, logging config. (en)  
+  - `ClientConfig` — 서버 주소, 도메인, 클라이언트 API Key, local_target, Debug 플래그, 로그 설정. (ko)  
+  - `ClientConfig` — server address, domain, client API key, local_target, debug flag, logging config. (en)
 
-서버 바이너리에서는 이 패키지에서 제공하는 인증서 매니저를 이용해 HTTPS(443)와 DTLS(443/UDP)의 인증서를 동일하게 또는 별도로 주입할 수 있다.
+---
 
-### internal/dtls
+### 2.3 `internal/acme`
 
-- DTLS 라이브러리(pion/dtls 등)에 대한 얇은 추상화 레이어
-- 서버:
-  - 다중 클라이언트 세션 관리 (클라이언트 ID 매핑)
-  - 재접속 및 세션 타임아웃 처리
-- 클라이언트:
-  - 서버와의 DTLS 핸드셰이크 및 재연결 로직
-  - 서버 인증(ACME로 발급된 인증서 체인 검증)
+- ACME(예: Let's Encrypt) 클라이언트 래퍼 및 인증서 매니저를 구현하는 패키지입니다. (ko)  
+- Package that will wrap an ACME client (e.g. Let's Encrypt) and manage certificates. (en)
 
-이 레이어는 단순히 `io.ReadWriteCloser` 또는 스트림 추상화를 제공해 상위 `proxy`/`protocol` 레이어에서 재사용 가능하게 한다.
+- 역할 / Responsibilities: (ko/en)  
+  - 메인 도메인 및 프록시 서브도메인용 TLS 인증서 발급/갱신. (ko)  
+  - Issue/renew TLS certificates for main and proxy domains. (en)  
+  - HTTP-01 / TLS-ALPN-01 챌린지 처리 훅 제공. (ko)  
+  - Provide hooks for HTTP-01 / TLS-ALPN-01 challenges. (en)  
+  - HTTPS/DTLS 리스너에 사용할 `*tls.Config` 제공. (ko)  
+  - Provide `*tls.Config` for HTTPS/DTLS listeners. (en)
 
-### internal/protocol
+---
 
-서버와 클라이언트가 DTLS 위에서 교환하는 메시지 포맷과 흐름을 정의한다.
+### 2.4 `internal/dtls`
 
-- 요청/응답 단위의 메시지 구조:
-  - `request_id`: 요청 식별자
-  - HTTP 메서드, URL, 헤더, 바디
-  - 타깃 서비스/포트 식별자
-- 응답 메시지 구조:
-  - `request_id`
-  - HTTP 상태 코드, 헤더, 바디
-- 인코딩 방식: JSON, MsgPack 또는 Protobuf 등 (초기에는 JSON으로 시작해도 됨)
-- Flow 제어 및 에러 코드 정의
+- DTLS 통신을 추상화하고, pion/dtls 기반 구현 및 핸드셰이크 로직을 포함합니다. (ko)  
+- Abstracts DTLS communication and includes a pion/dtls-based implementation plus handshake logic. (en)
 
-### internal/proxy
+- 주요 요소 / Main elements: (ko/en)  
+  - `Session`, `Server`, `Client` 인터페이스 — DTLS 위의 스트림과 서버/클라이언트를 추상화. (ko)  
+  - `Session`, `Server`, `Client` interfaces — abstract streams and server/client roles over DTLS. (en)  
+  - `NewPionServer`, `NewPionClient` — pion/dtls 를 사용하는 실제 구현. (ko)  
+  - `NewPionServer`, `NewPionClient` — concrete implementations using pion/dtls. (en)  
+  - `PerformServerHandshake`, `PerformClientHandshake` — 도메인 + 클라이언트 API Key 기반 애플리케이션 레벨 핸드셰이크. (ko)  
+  - `PerformServerHandshake`, `PerformClientHandshake` — application-level handshake based on domain + client API key. (en)  
+  - `NewSelfSignedLocalhostConfig` — 디버그용 localhost self-signed TLS 설정을 생성. (ko)  
+  - `NewSelfSignedLocalhostConfig` — generates a debug-only localhost self-signed TLS config. (en)
 
-#### 서버 측 역할
+---
 
-- 공인 HTTPS 엔드포인트에서 들어오는 HTTP 요청 수신
-- 도메인/패스 → 클라이언트 ID/서비스 매핑 룰에 따라 대상 클라이언트 선택
-- `protocol` 패키지를 사용해 HTTP 요청을 메시지로 직렬화 후 DTLS 세션으로 전송
-- 클라이언트로부터 받은 응답 메시지를 HTTP 응답으로 복원해 외부 클라이언트에 반환
-- 타임아웃, 재시도, 클라이언트 장애 시 fallback 정책 등 처리
+### 2.5 `internal/protocol`
 
-#### 클라이언트 측 역할
+- 서버와 클라이언트가 DTLS 위에서 주고받는 HTTP 요청/응답 메시지 포맷을 정의합니다. (ko)  
+- Defines HTTP request/response message formats exchanged over DTLS between server and clients. (en)
 
-- DTLS 채널을 통해 서버가 내려보낸 HTTP 요청 메시지 수신
-- 로컬에서 `net/http` 클라이언트 또는 직접 TCP 접속으로 지정된 `127.0.0.1:PORT`에 요청 수행
-- 응답을 수신해 `protocol` 포맷으로 직렬화 후 서버로 전송
-- 서버로부터 전달된 취소/타임아웃 신호에 따라 로컬 요청 중단
+- 요청 메시지 / Request message: (ko/en)  
+  - `RequestID`, `ClientID`, `ServiceName`, `Method`, `URL`, `Header`, `Body`. (ko/en)
 
-### internal/logging
+- 응답 메시지 / Response message: (ko/en)  
+  - `RequestID`, `Status`, `Header`, `Body`, `Error`. (ko/en)
 
-- 구조적 로깅 래퍼 (예: zap, zerolog 등)
-- 공통 로그 포맷 및 필드 (request_id, client_id, route 등) 정의
+- 인코딩은 초기에는 JSON을 사용하고, 필요 시 MsgPack/Protobuf 등으로 확장 가능합니다. (ko)  
+- Encoding starts with JSON and may be extended to MsgPack/Protobuf later. (en)
 
-### pkg/util (선택)
+---
 
-- 재사용 가능한 헬퍼 유틸리티(에러 래핑, context 유틸 등)를 배치할 수 있는 공간이다.
+### 2.6 `internal/proxy`
 
-## 요청 흐름 요약
+- HTTP Reverse Proxy 및 클라이언트 측 로컬 프록시 코어 로직을 담당합니다. (ko)  
+- Contains the core logic for the HTTP reverse proxy on the server and the local proxy on the client. (en)
 
-1. 외부 사용자가 `https://proxy.example.com/service-a/path` 로 요청을 보낸다.
-2. 서버의 HTTPS 리스너가 요청을 수신한다.
-3. `proxy` 레이어가 라우팅 규칙에 따라 이 요청을 처리할 클라이언트(예: `client-1`)와 로컬 서비스(`service-a`)를 결정한다.
-4. 요청을 `protocol` 포맷으로 직렬화해 `dtls` 레이어를 통해 `client-1`로 전송한다.
-5. 클라이언트의 `proxy` 레이어가 메시지를 받아 로컬 `127.0.0.1:8080` 등으로 HTTP 요청을 수행한다.
-6. 클라이언트는 응답을 수신해 `protocol` 포맷으로 직렬화 후 DTLS로 서버에 전송한다.
-7. 서버는 응답 메시지를 HTTP 응답으로 복원해 원래의 외부 요청에 대한 응답으로 반환한다.
+#### 서버 측 역할 / Server-side role
+
+- 공인 HTTPS 엔드포인트에서 들어오는 요청을 수신합니다. (ko)  
+- Receive incoming requests on the public HTTPS endpoint. (en)
+
+- 도메인/패스 규칙에 따라 적절한 클라이언트와 서비스로 매핑합니다. (ko)  
+- Map requests to appropriate clients and services based on domain/path rules. (en)
+
+- 요청을 `protocol.Request` 로 직렬화하여 DTLS 세션을 통해 클라이언트로 전송합니다. (ko)  
+- Serialize the request as `protocol.Request` and send it over a DTLS session to the client. (en)
+
+- 클라이언트로부터 받은 `protocol.Response` 를 HTTP 응답으로 복원하여 외부 사용자에게 반환합니다. (ko)  
+- Deserialize `protocol.Response` from the client and return it as an HTTP response to the external user. (en)
+
+#### 클라이언트 측 역할 / Client-side role
+
+- DTLS 채널을 통해 서버가 내려보낸 `protocol.Request` 를 수신합니다. (ko)  
+- Receive `protocol.Request` objects sent by the server over DTLS. (en)
+
+- 로컬 HTTP 서비스(예: 127.0.0.1:8080)에 요청을 전달하고 응답을 수신합니다. (ko)  
+- Forward these requests to local HTTP services (e.g. 127.0.0.1:8080) and collect responses. (en)
+
+- 응답을 `protocol.Response` 로 직렬화하여 DTLS 채널을 통해 서버로 전송합니다. (ko)  
+- Serialize responses as `protocol.Response` and send them back to the server over DTLS. (en)
+
+---
+
+### 2.7 `internal/logging`
+
+- Loki/Grafana 스택에 적합한 구조적 JSON 로깅 인터페이스를 제공합니다. (ko)  
+- Provides a structured JSON logging interface compatible with the Loki/Grafana stack. (en)
+
+- 공통 필드 (예: component, request_id, client_id, domain 등)를 포함한 Logger 를 제공합니다. (ko)  
+- Offers a Logger that includes common fields (e.g., component, request_id, client_id, domain). (en)
+
+---
+
+### 2.8 `ent/schema`
+
+- `Domain` 등 엔티티에 대한 ent 스키마를 정의합니다. (ko)  
+- Defines ent schemas for entities such as `Domain`. (en)
+
+- Domain 엔티티는 다음 정보를 포함합니다: (ko)  
+- The Domain entity contains the following fields: (en)  
+  - UUID `id` — 기본 키 / primary key. (ko/en)  
+  - `domain` — FQDN (예: app.example.com). (ko/en)  
+  - `client_api_key` — 클라이언트 인증용 64자 키. (ko/en)  
+  - `memo` — 관리자 메모. (ko/en)  
+  - `created_at`, `updated_at` — 감사용 타임스탬프. (ko/en)
+
+---
+
+### 2.9 `pkg/util` (optional)
+
+- 재사용 가능한 헬퍼 함수/유틸리티를 둘 수 있는 선택적 패키지입니다. (ko)  
+- Optional package for reusable helpers and utilities. (en)
+
+---
+
+## 3. Request Flow Summary / 요청 흐름 요약
+
+1. 외부 사용자가 `https://proxy.example.com/service-a/path` 로 HTTPS 요청을 보냅니다. (ko)  
+1. An external user sends an HTTPS request to `https://proxy.example.com/service-a/path`. (en)
+
+2. HopGate 서버의 HTTPS 리스너가 요청을 수신합니다. (ko)  
+2. The HTTPS listener on the HopGate server receives the request. (en)
+
+3. `proxy` 레이어가 도메인과 경로를 기반으로 이 요청을 처리할 클라이언트(예: client-1)와 해당 로컬 서비스(`service-a`)를 결정합니다. (ko)  
+3. The `proxy` layer decides which client (e.g., client-1) and which local service (`service-a`) should handle the request, based on domain and path. (en)
+
+4. 서버는 요청을 `protocol.Request` 구조로 직렬화하고, `dtls.Session` 을 통해 선택된 클라이언트로 전송합니다. (ko)  
+4. The server serializes the request into a `protocol.Request` and sends it to the selected client over a `dtls.Session`. (en)
+
+5. 클라이언트의 `proxy` 레이어는 `protocol.Request` 를 수신하고, 로컬 서비스(예: 127.0.0.1:8080)에 HTTP 요청을 수행합니다. (ko)  
+5. The client’s `proxy` layer receives the `protocol.Request` and performs an HTTP request to a local service (e.g., 127.0.0.1:8080). (en)
+
+6. 클라이언트는 로컬 서비스로부터 HTTP 응답을 수신하고, 이를 `protocol.Response` 로 직렬화하여 DTLS 채널을 통해 서버로 다시 전송합니다. (ko)  
+6. The client receives the HTTP response from the local service, serializes it as a `protocol.Response`, and sends it back to the server over DTLS. (en)
+
+7. 서버는 `protocol.Response` 를 디코딩하여 원래의 HTTPS 요청에 대한 HTTP 응답으로 변환한 뒤, 외부 사용자에게 반환합니다. (ko)  
+7. The server decodes the `protocol.Response`, converts it back into an HTTP response, and returns it to the original external user. (en)
 
 ![architecture.jpeg](images/architecture.jpeg)
 
-## 다음 단계
+---
 
-- 위 레이아웃대로 디렉터리와 최소한의 엔트리 포인트 파일을 생성한 뒤,
-- `internal/config`에 설정 구조체와 YAML/JSON 로더를 정의하고,
-- `internal/acme`에서 certmagic 또는 lego를 사용한 ACME 매니저를 구현하고,
-- `internal/dtls`에서 pion/dtls 기반의 세션 래퍼를 만든 다음,
-- `internal/protocol`과 `internal/proxy`를 순차적으로 구현하면 된다.
+## 4. Next Steps / 다음 단계
+
+- 위 아키텍처를 기반으로 디렉터리와 엔트리 포인트를 생성/정리합니다. (ko)  
+- Use this architecture to create/organize directories and entrypoints. (en)
+
+- `internal/config` 에 필요한 설정 필드와 `.env` 로더를 확장합니다. (ko)  
+- Extend `internal/config` with required config fields and `.env` loaders. (en)
+
+- `internal/acme` 에 ACME 클라이언트(certmagic 또는 lego 등)를 연결해 TLS 인증서 발급/갱신을 구현합니다. (ko)  
+- Wire an ACME client (certmagic, lego, etc.) into `internal/acme` to implement TLS certificate issuance/renewal. (en)
+
+- `internal/dtls` 에서 pion/dtls 기반 DTLS 전송 계층 및 핸드셰이크를 안정화합니다. (ko)  
+- Stabilize the pion/dtls-based DTLS transport and handshake logic in `internal/dtls`. (en)
+
+- `internal/protocol` 과 `internal/proxy` 를 통해 실제 HTTP 터널링을 구현하고, 라우팅 규칙을 구성합니다. (ko)  
+- Implement real HTTP tunneling and routing rules via `internal/protocol` and `internal/proxy`. (en)
+
+- `internal/admin` + `ent` + PostgreSQL 을 사용해 Domain 등록/해제 및 클라이언트 API Key 발급을 완성합니다. (ko)  
+- Complete domain registration/unregistration and client API key issuing using `internal/admin` + `ent` + PostgreSQL. (en)
+
+- 로깅/메트릭을 Prometheus + Loki + Grafana 스택과 연동하여 운영 가시성을 확보합니다. (ko)  
+- Integrate logging/metrics with the Prometheus + Loki + Grafana stack to gain operational visibility. (en)
