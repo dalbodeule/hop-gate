@@ -54,12 +54,33 @@ func NewPionServer(cfg PionServerConfig) (Server, error) {
 		return nil, fmt.Errorf("resolve udp addr: %w", err)
 	}
 
-	dtlsCfg := &piondtls.Config{
-		Certificates:       cfg.TLSConfig.Certificates,
-		InsecureSkipVerify: cfg.TLSConfig.InsecureSkipVerify,
-		// 필요 시 RootCAs, ClientAuth, ExtendedMasterSecret 등을 추가 설정
+	// tls.Config.GetCertificate (crypto/tls) → pion/dtls.GetCertificate 어댑터
+	var getCert func(*piondtls.ClientHelloInfo) (*tls.Certificate, error)
+	if cfg.TLSConfig.GetCertificate != nil {
+		tlsGetCert := cfg.TLSConfig.GetCertificate
+		getCert = func(chi *piondtls.ClientHelloInfo) (*tls.Certificate, error) {
+			if chi == nil {
+				return tlsGetCert(&tls.ClientHelloInfo{})
+			}
+			// ACME 매니저는 주로 SNI(ServerName)에 기반해 인증서를 선택하므로,
+			// 필요한 최소 필드만 복사해서 전달한다.
+			return tlsGetCert(&tls.ClientHelloInfo{
+				ServerName: chi.ServerName,
+			})
+		}
 	}
 
+	dtlsCfg := &piondtls.Config{
+		// 서버가 사용할 인증서 설정: 정적 Certificates + GetCertificate 어댑터
+		Certificates:       cfg.TLSConfig.Certificates,
+		GetCertificate:     getCert,
+		InsecureSkipVerify: cfg.TLSConfig.InsecureSkipVerify,
+		ClientAuth:         piondtls.ClientAuthType(cfg.TLSConfig.ClientAuth),
+		ClientCAs:          cfg.TLSConfig.ClientCAs,
+		RootCAs:            cfg.TLSConfig.RootCAs,
+		ServerName:         cfg.TLSConfig.ServerName,
+		// 필요 시 ExtendedMasterSecret 등을 추가 설정
+	}
 	l, err := piondtls.Listen("udp", udpAddr, dtlsCfg)
 	if err != nil {
 		return nil, fmt.Errorf("dtls listen: %w", err)
@@ -154,9 +175,12 @@ func (c *pionClient) Connect() (Session, error) {
 	}
 
 	dtlsCfg := &piondtls.Config{
+		// 클라이언트는 서버 인증을 위해 RootCAs/ServerName 만 사용.
+		// (현재는 클라이언트 인증서 사용 계획이 없으므로 GetCertificate 는 전달하지 않는다.)
 		Certificates:       c.tlsConfig.Certificates,
 		InsecureSkipVerify: c.tlsConfig.InsecureSkipVerify,
-		// 필요 시 ServerName, RootCAs 등 추가 설정
+		RootCAs:            c.tlsConfig.RootCAs,
+		ServerName:         c.tlsConfig.ServerName,
 	}
 
 	type result struct {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"os"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/dalbodeule/hop-gate/internal/config"
 	"github.com/dalbodeule/hop-gate/internal/dtls"
 	"github.com/dalbodeule/hop-gate/internal/logging"
+	"github.com/dalbodeule/hop-gate/internal/proxy"
 )
 
 // maskAPIKey 는 로그에 노출할 때 클라이언트 API Key 를 일부만 보여주기 위한 헬퍼입니다.
@@ -103,7 +105,20 @@ func main() {
 			InsecureSkipVerify: true,
 			MinVersion:         tls.VersionTLS12,
 		}
+	} else {
+		// 운영 모드: 시스템 루트 CA + SNI(ServerName)에 서버 도메인 설정
+		rootCAs, err := x509.SystemCertPool()
+		if err != nil || rootCAs == nil {
+			rootCAs = x509.NewCertPool()
+		}
+		tlsCfg = &tls.Config{
+			RootCAs:    rootCAs,
+			MinVersion: tls.VersionTLS12,
+		}
 	}
+	// DTLS 서버 측은 SNI(ServerName)가 HOP_SERVER_DOMAIN(cfg.Domain)과 일치하는지 검사하므로,
+	// 클라이언트 TLS 설정에도 반드시 도메인을 설정해준다.
+	tlsCfg.ServerName = finalCfg.Domain
 
 	client := dtls.NewPionClient(dtls.PionClientConfig{
 		Addr:      finalCfg.ServerAddr,
@@ -131,4 +146,19 @@ func main() {
 		"domain":       hsRes.Domain,
 		"local_target": finalCfg.LocalTarget,
 	})
+
+	// 5. DTLS 세션 위에서 서버 요청을 처리하는 클라이언트 프록시 루프 시작
+	clientProxy := proxy.NewClientProxy(logger, finalCfg.LocalTarget)
+	logger.Info("starting client proxy loop", logging.Fields{
+		"local_target": finalCfg.LocalTarget,
+	})
+
+	if err := clientProxy.StartLoop(ctx, sess); err != nil {
+		logger.Error("client proxy loop exited with error", logging.Fields{
+			"error": err.Error(),
+		})
+		os.Exit(1)
+	}
+
+	logger.Info("client proxy loop exited normally", nil)
 }

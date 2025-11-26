@@ -1,2 +1,5 @@
 # Docker build context excludes
 images/
+bin/
+acme-cache/
+acme-webroot/

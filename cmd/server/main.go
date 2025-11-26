@@ -3,13 +3,264 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
 
+	"github.com/dalbodeule/hop-gate/internal/acme"
 	"github.com/dalbodeule/hop-gate/internal/config"
 	"github.com/dalbodeule/hop-gate/internal/dtls"
 	"github.com/dalbodeule/hop-gate/internal/logging"
+	"github.com/dalbodeule/hop-gate/internal/protocol"
 	"github.com/dalbodeule/hop-gate/internal/store"
 )
+
+type dtlsSessionWrapper struct {
+	sess dtls.Session
+	mu   sync.Mutex
+}
+
+// domainGateValidator 는 DTLS 핸드셰이크에서 허용된 도메인(HOP_SERVER_DOMAIN)만 통과시키기 위한 래퍼입니다. (ko)
+// domainGateValidator wraps another DomainValidator and allows only the configured HOP_SERVER_DOMAIN. (en)
+type domainGateValidator struct {
+	allowed string
+	inner   dtls.DomainValidator
+	logger  logging.Logger
+}
+
+func (v *domainGateValidator) ValidateDomainAPIKey(ctx context.Context, domain, clientAPIKey string) error {
+	d := strings.ToLower(strings.TrimSpace(domain))
+	if v.allowed != "" && d != v.allowed {
+		if v.logger != nil {
+			v.logger.Warn("dtls handshake rejected due to mismatched domain", logging.Fields{
+				"expected_domain": v.allowed,
+				"received_domain": d,
+			})
+		}
+		return fmt.Errorf("domain %s is not allowed for dtls handshake", domain)
+	}
+	if v.inner != nil {
+		return v.inner.ValidateDomainAPIKey(ctx, domain, clientAPIKey)
+	}
+	return nil
+}
+
+// ForwardHTTP 는 단일 HTTP 요청을 DTLS 세션으로 포워딩하고 응답을 돌려받습니다.
+// ForwardHTTP forwards a single HTTP request over the DTLS session and returns the response.
+func (w *dtlsSessionWrapper) ForwardHTTP(ctx context.Context, logger logging.Logger, req *http.Request, serviceName string) (*protocol.Response, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// 요청 본문 읽기
+	var body []byte
+	if req.Body != nil {
+		b, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		body = b
+	}
+
+	// 간단한 RequestID 생성 (실제 서비스에서는 UUID 등을 사용하는 것이 좋음)
+	requestID := time.Now().UTC().Format("20060102T150405.000000000")
+
+	protoReq := &protocol.Request{
+		RequestID:   requestID,
+		ClientID:    "", // TODO: 클라이언트 식별자 도입 시 채우기
+		ServiceName: serviceName,
+		Method:      req.Method,
+		URL:         req.URL.String(),
+		Header:      req.Header.Clone(),
+		Body:        body,
+	}
+
+	log := logger.With(logging.Fields{
+		"component":  "http_to_dtls",
+		"request_id": requestID,
+		"method":     req.Method,
+		"url":        req.URL.String(),
+	})
+
+	log.Info("forwarding http request over dtls", logging.Fields{
+		"host":   req.Host,
+		"scheme": req.URL.Scheme,
+	})
+
+	enc := json.NewEncoder(w.sess)
+	if err := enc.Encode(protoReq); err != nil {
+		log.Error("failed to encode protocol request", logging.Fields{
+			"error": err.Error(),
+		})
+		return nil, err
+	}
+
+	var protoResp protocol.Response
+	dec := json.NewDecoder(w.sess)
+	if err := dec.Decode(&protoResp); err != nil {
+		log.Error("failed to decode protocol response", logging.Fields{
+			"error": err.Error(),
+		})
+		return nil, err
+	}
+
+	log.Info("received dtls response", logging.Fields{
+		"status": protoResp.Status,
+		"error":  protoResp.Error,
+	})
+
+	return &protoResp, nil
+}
+
+var (
+	sessionsMu       sync.RWMutex
+	sessionsByDomain = make(map[string]*dtlsSessionWrapper)
+)
+
+func registerSessionForDomain(domain string, sess dtls.Session, logger logging.Logger) {
+	d := strings.ToLower(strings.TrimSpace(domain))
+	if d == "" {
+		return
+	}
+	w := &dtlsSessionWrapper{sess: sess}
+	sessionsMu.Lock()
+	sessionsByDomain[d] = w
+	sessionsMu.Unlock()
+
+	logger.Info("registered dtls session for domain", logging.Fields{
+		"domain": d,
+		"sid":    sess.ID(),
+	})
+}
+
+func getSessionForHost(host string) *dtlsSessionWrapper {
+	// host may contain port (e.g. "example.com:443"); strip port.
+	h := host
+	if i := strings.Index(h, ":"); i != -1 {
+		h = h[:i]
+	}
+	h = strings.ToLower(strings.TrimSpace(h))
+	if h == "" {
+		return nil
+	}
+	sessionsMu.RLock()
+	defer sessionsMu.RUnlock()
+	return sessionsByDomain[h]
+}
+
+func newHTTPHandler(logger logging.Logger) http.Handler {
+	// ACME webroot (for HTTP-01) is read from env; must match HOP_ACME_WEBROOT used by lego.
+	webroot := strings.TrimSpace(os.Getenv("HOP_ACME_WEBROOT"))
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		log := logger.With(logging.Fields{
+			"component": "http_entry",
+			"method":    r.Method,
+			"url":       r.URL.String(),
+			"host":      r.Host,
+		})
+		log.Info("incoming http request", nil)
+
+		// 1. ACME HTTP-01 webroot handling
+		// /.well-known/acme-challenge/{token} 는 HOP_ACME_WEBROOT 디렉터리에서 정적 파일로 서빙합니다.
+		if webroot != "" && strings.HasPrefix(r.URL.Path, "/.well-known/acme-challenge/") {
+			token := strings.Trim(r.URL.Path, "/")
+			if token == "" {
+				http.Error(w, "invalid acme challenge path", http.StatusBadRequest)
+				return
+			}
+			filePath := filepath.Join(webroot, token)
+
+			log := logger.With(logging.Fields{
+				"component": "acme_http01",
+				"host":      r.Host,
+				"token":     token,
+				"path":      r.URL.Path,
+				"file":      filePath,
+			})
+			log.Info("serving acme http-01 challenge", nil)
+
+			f, err := os.Open(filePath)
+			if err != nil {
+				log.Error("failed to open acme challenge file", logging.Fields{
+					"error": err.Error(),
+				})
+				http.NotFound(w, r)
+				return
+			}
+			defer f.Close()
+
+			// ACME challenge 응답은 일반적으로 text/plain.
+			w.Header().Set("Content-Type", "text/plain")
+			if _, err := io.Copy(w, f); err != nil {
+				log.Error("failed to write acme challenge response", logging.Fields{
+					"error": err.Error(),
+				})
+			}
+			return
+		}
+
+		// 2. 일반 HTTP 요청은 DTLS 를 통해 클라이언트로 포워딩
+		// 간단한 서비스 이름 결정: 우선 "web" 고정, 추후 Router 도입 시 개선.
+		serviceName := "web"
+
+		sessWrapper := getSessionForHost(r.Host)
+		if sessWrapper == nil {
+			log.Warn("no dtls session for host", logging.Fields{
+				"host": r.Host,
+			})
+			http.Error(w, "no backend client available", http.StatusBadGateway)
+			return
+		}
+
+		// r.Body 는 ForwardHTTP 내에서 읽고 닫지 않으므로 여기서 닫기
+		defer r.Body.Close()
+
+		ctx := r.Context()
+		protoResp, err := sessWrapper.ForwardHTTP(ctx, logger, r, serviceName)
+		if err != nil {
+			log.Error("forward over dtls failed", logging.Fields{
+				"error": err.Error(),
+			})
+			http.Error(w, "dtls forward failed", http.StatusBadGateway)
+			return
+		}
+
+		// 응답 헤더/바디 복원
+		for k, vs := range protoResp.Header {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		if protoResp.Status == 0 {
+			protoResp.Status = http.StatusOK
+		}
+		w.WriteHeader(protoResp.Status)
+		if len(protoResp.Body) > 0 {
+			if _, err := w.Write(protoResp.Body); err != nil {
+				log.Warn("failed to write http response body", logging.Fields{
+					"error": err.Error(),
+				})
+			}
+		}
+
+		log.Info("http request completed", logging.Fields{
+			"status":       protoResp.Status,
+			"elapsed_ms":   time.Since(start).Milliseconds(),
+			"service_name": serviceName,
+		})
+	})
+}
 
 func main() {
 	logger := logging.NewStdJSONLogger("server")
@@ -32,8 +283,9 @@ func main() {
 		"debug":        cfg.Debug,
 	})
 
-	// 2. PostgreSQL 연결 및 스키마 초기화 (ent 기반)
 	ctx := context.Background()
+
+	// 2. PostgreSQL 연결 및 스키마 초기화 (ent 기반)
 	dbClient, err := store.OpenPostgresFromEnv(ctx, logger)
 	if err != nil {
 		logger.Error("failed to init postgres for admin/domain store", logging.Fields{
@@ -47,14 +299,43 @@ func main() {
 		"component": "store",
 	})
 
-	// 3. DTLS 서버 리스너 생성 (pion/dtls 기반)
-	//
-	// Debug 모드일 때는 self-signed localhost 인증서를 사용해 테스트 할 수 있도록
-	// internal/dtls.NewSelfSignedLocalhostConfig() 를 사용합니다.
-	// 운영 환경에서는 internal/acme.Manager 를 통해 얻은 tls.Config 를
-	// PionServerConfig.TLSConfig 로 전달해야 합니다.
+	// 3. TLS 설정: ACME(lego)로 인증서를 관리하고, Debug 모드에서는 DTLS에는 self-signed 를 사용하되
+	// ACME 는 항상 시도하되 Staging 모드로 동작하도록 합니다.
+	// 3. TLS setup: manage certificates via ACME (lego); in debug mode DTLS uses self-signed
+	// but ACME is still attempted in staging mode.
 	var tlsCfg *tls.Config
+
+	// ACME 를 위해 사용할 도메인 목록 구성
+	var domains []string
+	if cfg.Domain != "" {
+		domains = append(domains, cfg.Domain)
+	}
+	domains = append(domains, cfg.ProxyDomains...)
+
+	// Debug 모드에서는 반드시 Staging CA 를 사용하도록 강제
 	if cfg.Debug {
+		_ = os.Setenv("HOP_ACME_USE_STAGING", "true")
+	}
+
+	// ACME(lego) 매니저 초기화: 도메인 DNS 확인 + 인증서 확보/갱신 + 캐시 저장
+	acmeMgr, err := acme.NewLegoManagerFromEnv(ctx, logger, domains)
+	if err != nil {
+		logger.Error("failed to initialize ACME lego manager", logging.Fields{
+			"error":   err.Error(),
+			"domains": domains,
+		})
+		os.Exit(1)
+	}
+	acmeTLSCfg := acmeMgr.TLSConfig()
+
+	logger.Info("acme tls config initialized", logging.Fields{
+		"domains":     domains,
+		"use_staging": cfg.Debug,
+	})
+
+	if cfg.Debug {
+		// Debug 모드: DTLS 자체는 self-signed localhost 인증서를 사용하지만,
+		// ACME Staging 을 통해 실제 도메인 인증서도 동시에 관리합니다.
 		tlsCfg, err = dtls.NewSelfSignedLocalhostConfig()
 		if err != nil {
 			logger.Error("failed to create self-signed localhost cert", logging.Fields{
@@ -63,13 +344,42 @@ func main() {
 			os.Exit(1)
 		}
 		logger.Warn("using self-signed localhost certificate for DTLS (debug mode)", logging.Fields{
-			"note": "do not use this in production",
+			"note": "acme is running in staging mode; do not use this configuration in production",
 		})
+	} else {
+		// Production 모드: DTLS/HTTPS 모두 ACME 인증서를 직접 사용
+		tlsCfg = acmeTLSCfg
 	}
 
+	// DTLS 서버는 HOP_SERVER_DOMAIN 으로 지정된 도메인에 대한 연결만 수락해야 합니다.
+	// 이를 위해 GetCertificate 를 래핑하여 SNI 검증 로직을 추가합니다.
+	// 주의: HTTPS 서버용 tlsCfg 에 영향을 주지 않도록 Clone()을 사용합니다.
+	dtlsTLSConfig := tlsCfg.Clone()
+	if cfg.Domain != "" {
+		nextGetCert := dtlsTLSConfig.GetCertificate
+		dtlsTLSConfig.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			// SNI 검증: 설정된 도메인과 일치하지 않으면 핸드셰이크 거부
+			// ServerName이 비어있는 경우(클라이언트가 SNI 미전송 시)는 검증을 건너뜁니다.
+			if hello.ServerName != "" && !strings.EqualFold(hello.ServerName, cfg.Domain) {
+				return nil, fmt.Errorf("dtls: invalid SNI %q, expected %q", hello.ServerName, cfg.Domain)
+			}
+
+			// 기존 로직 수행
+			if nextGetCert != nil {
+				return nextGetCert(hello)
+			}
+			// Debug 모드 등에서 GetCertificate 가 없는 경우 Certificates 필드 사용
+			if len(dtlsTLSConfig.Certificates) > 0 {
+				return &dtlsTLSConfig.Certificates[0], nil
+			}
+			return nil, fmt.Errorf("dtls: no certificate found for %q", hello.ServerName)
+		}
+	}
+
+	// 4. DTLS 서버 리스너 생성 (pion/dtls 기반)
 	dtlsServer, err := dtls.NewPionServer(dtls.PionServerConfig{
 		Addr:      cfg.DTLSListen,
-		TLSConfig: tlsCfg, // debug 모드면 self-signed, 아니면 nil(기본값/ACME로 교체 예정)
+		TLSConfig: dtlsTLSConfig,
 	})
 	if err != nil {
 		logger.Error("failed to start dtls server", logging.Fields{
@@ -83,16 +393,56 @@ func main() {
 		"addr": cfg.DTLSListen,
 	})
 
-	// 3. 도메인 검증기 준비 (현재는 Dummy 구현)
-	//
-	// DomainValidator 는 (domain, client_api_key) 조합을 검증합니다.
-	// 지금은 DummyDomainValidator 로 모두 허용하지만,
-	// 향후 ent + PostgreSQL 기반 구현으로 교체해야 합니다.
-	validator := dtls.DummyDomainValidator{
+	// 5. HTTP / HTTPS 서버 시작
+	httpHandler := newHTTPHandler(logger)
+
+	// HTTP: 평문 포트
+	httpSrv := &http.Server{
+		Addr:    cfg.HTTPListen,
+		Handler: httpHandler,
+	}
+	go func() {
+		logger.Info("http server listening", logging.Fields{
+			"addr": cfg.HTTPListen,
+		})
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("http server error", logging.Fields{
+				"error": err.Error(),
+			})
+		}
+	}()
+
+	// HTTPS: ACME 기반 TLS 사용 (debug 모드에서도 ACME tls config 사용 가능)
+	httpsSrv := &http.Server{
+		Addr:      cfg.HTTPSListen,
+		Handler:   httpHandler,
+		TLSConfig: acmeTLSCfg,
+	}
+	go func() {
+		logger.Info("https server listening", logging.Fields{
+			"addr": cfg.HTTPSListen,
+		})
+		if err := httpsSrv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			logger.Error("https server error", logging.Fields{
+				"error": err.Error(),
+			})
+		}
+	}()
+
+	// 6. 도메인 검증기 준비 (현재는 Dummy 구현, 추후 ent + PostgreSQL 기반으로 교체 예정)
+	baseValidator := dtls.DummyDomainValidator{
 		Logger: logger,
 	}
 
-	// 4. DTLS Accept 루프 + Handshake
+	// DTLS 핸드셰이크 단계에서 HOP_SERVER_DOMAIN 으로 설정된 도메인만 허용하도록 래핑합니다.
+	allowedDomain := strings.ToLower(strings.TrimSpace(cfg.Domain))
+	var validator dtls.DomainValidator = &domainGateValidator{
+		allowed: allowedDomain,
+		inner:   baseValidator,
+		logger:  logger,
+	}
+
+	// 7. DTLS Accept 루프 + Handshake
 	for {
 		sess, err := dtlsServer.Accept()
 		if err != nil {
@@ -104,8 +454,8 @@ func main() {
 
 		// 각 세션별로 goroutine 에서 핸드셰이크 및 후속 처리를 수행합니다.
 		go func(s dtls.Session) {
-			defer s.Close()
-
+			// NOTE: 세션은 HTTP↔DTLS 터널링에 계속 사용해야 하므로 이곳에서 Close 하지 않습니다.
+			// 세션 종료/타임아웃 관리는 별도의 세션 매니저(TODO)에서 담당해야 합니다.
 			hsRes, err := dtls.PerformServerHandshake(ctx, s, validator, logger)
 			if err != nil {
 				// PerformServerHandshake 내부에서 이미 상세 로그를 남기므로 여기서는 요약만 기록합니다.
@@ -113,6 +463,9 @@ func main() {
 					"session_id": s.ID(),
 					"error":      err.Error(),
 				})
+				// 핸드셰이크 실패 시 세션을 명시적으로 종료하여 invalid SNI 등 오류에서
+				// 연결이 열린 채로 남지 않도록 합니다.
+				_ = s.Close()
 				return
 			}
 
@@ -121,6 +474,29 @@ func main() {
 				"session_id": s.ID(),
 				"domain":     hsRes.Domain,
 			})
+
+			// Handshake 가 완료된 세션을 도메인에 매핑해 HTTP 요청 시 사용할 수 있도록 등록합니다.
+			registerSessionForDomain(hsRes.Domain, s, logger)
+
+			// Handshake 가 정상적으로 끝난 이후, 실제로 해당 도메인에 대해 ACME 인증서를 확보/연장합니다.
+			// Debug 모드에서도 ACME 는 항상 시도하지만, 위에서 HOP_ACME_USE_STAGING=true 로 설정되어
+			// Staging CA 를 사용하게 됩니다.
+			if hsRes.Domain != "" {
+				go func(domain string) {
+					acmeLogger := logger.With(logging.Fields{
+						"component": "acme_post_handshake",
+						"domain":    domain,
+						"debug":     cfg.Debug,
+					})
+					if _, err := acme.NewLegoManagerFromEnv(context.Background(), acmeLogger, []string{domain}); err != nil {
+						acmeLogger.Error("failed to ensure acme certificate after dtls handshake", logging.Fields{
+							"error": err.Error(),
+						})
+						return
+					}
+					acmeLogger.Info("acme certificate ensured after dtls handshake", nil)
+				}(hsRes.Domain)
+			}
 
 			// TODO:
 			//   - hsRes.Domain 과 연결된 세션을 proxy 레이어에 등록
