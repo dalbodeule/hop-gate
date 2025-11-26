@@ -8,6 +8,7 @@ import (
 	"github.com/dalbodeule/hop-gate/internal/config"
 	"github.com/dalbodeule/hop-gate/internal/dtls"
 	"github.com/dalbodeule/hop-gate/internal/logging"
+	"github.com/dalbodeule/hop-gate/internal/store"
 )
 
 func main() {
@@ -31,7 +32,22 @@ func main() {
 		"debug":        cfg.Debug,
 	})
 
-	// 2. DTLS 서버 리스너 생성 (pion/dtls 기반)
+	// 2. PostgreSQL 연결 및 스키마 초기화 (ent 기반)
+	ctx := context.Background()
+	dbClient, err := store.OpenPostgresFromEnv(ctx, logger)
+	if err != nil {
+		logger.Error("failed to init postgres for admin/domain store", logging.Fields{
+			"error": err.Error(),
+		})
+		os.Exit(1)
+	}
+	defer dbClient.Close()
+
+	logger.Info("postgres connected and schema ready", logging.Fields{
+		"component": "store",
+	})
+
+	// 3. DTLS 서버 리스너 생성 (pion/dtls 기반)
 	//
 	// Debug 모드일 때는 self-signed localhost 인증서를 사용해 테스트 할 수 있도록
 	// internal/dtls.NewSelfSignedLocalhostConfig() 를 사용합니다.
@@ -75,8 +91,6 @@ func main() {
 	validator := dtls.DummyDomainValidator{
 		Logger: logger,
 	}
-
-	ctx := context.Background()
 
 	// 4. DTLS Accept 루프 + Handshake
 	for {
