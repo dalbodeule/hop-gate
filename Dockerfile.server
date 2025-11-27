@@ -14,23 +14,27 @@
 # ---------- Build stage ----------
 FROM golang:1.22-alpine AS builder
 
+# BuildKit / buildx 가 제공하는 타겟 OS/ARCH 인자를 사용해 멀티 아키텍처 빌드를 지원합니다.
+# 기본값을 지정해두면 로컬 docker build 시에도 별도 인자 없이 빌드 가능합니다.
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
 WORKDIR /src
 
 # 모듈/의존성 캐시를 최대한 활용하기 위해 go.mod, go.sum 먼저 복사
 COPY go.mod ./
-# go.sum 이 있다면 같이 복사 (없으면 무시)
-# hadolint ignore=DL3059
-RUN if [ -f go.sum ]; then cp go.sum ./; fi
+COPY go.sum ./
 
 RUN go env -w GOPROXY=https://proxy.golang.org,direct
 
-RUN go mod download || true
+# 의존성 다운로드 (캐시 활용을 위해 소스 전체 복사 전에 실행)
+RUN go mod download
 
 # 실제 소스 코드 복사
 COPY . .
 
-# 서버 바이너리 빌드
-RUN CGO_ENABLED=0 GOOS=linux go build -o /out/hop-gate-server ./cmd/server
+# 서버 바이너리 빌드 (멀티 아키텍처: TARGETOS/TARGETARCH 기반)
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/hop-gate-server ./cmd/server
 
 # ---------- Runtime stage ----------
 FROM alpine:3.20
