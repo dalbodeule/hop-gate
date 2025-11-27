@@ -30,7 +30,7 @@ RUN go mod download || true
 COPY . .
 
 # 서버 바이너리 빌드
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/hop-gate-server ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/hop-gate-server ./cmd/server
 
 # ---------- Runtime stage ----------
 FROM alpine:3.20
