@@ -1,0 +1,59 @@
+version: "3.9"
+
+services:
+  hop-gate-server:
+    image: ghcr.io/dalbodeule/hop-gate:latest
+    container_name: hop-gate-server
+    restart: unless-stopped
+
+    # 서버 설정은 기본적으로 .env 에서 로드하고,
+    # compose 레벨에서 일부 값을 override 합니다.
+    env_file:
+      - .env
+    environment:
+      # Compose 네트워크 상의 postgres 서비스로 DSN 수정
+      HOP_DB_DSN: postgres://user:pass@postgres:5432/hopgate?sslmode=disable
+
+      # ACME 캐시/웹루트 디렉터리를 컨테이너 내부 경로에 맞게 재정의
+      HOP_ACME_CACHE_DIR: /app/acme-cache
+      HOP_ACME_WEBROOT: /app/acme-webroot
+
+      # 예시: 컨테이너 내부 포트에 맞게 HTTP/HTTPS/DTLS 포트를 명시적으로 설정하고 싶다면 사용
+      # HOP_SERVER_HTTP_LISTEN: ":8080"
+      # HOP_SERVER_HTTPS_LISTEN: ":8443"
+      # HOP_SERVER_DTLS_LISTEN: ":8443"
+
+    ports:
+      # 외부 80/443 → 컨테이너 8080/8443 매핑 (예: .env.example 기준)
+      - "80:8080"        # HTTP
+      - "443:8443"       # HTTPS (TCP)
+      - "443:8443/udp"   # DTLS (UDP)
+
+    volumes:
+      # ACME 인증서/계정 캐시 디렉터리 (호스트에 지속 보관)
+      - ./acme-cache:/app/acme-cache
+      # ACME HTTP-01 webroot 디렉터리
+      - ./acme-webroot:/app/acme-webroot
+
+    depends_on:
+      - postgres
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: hop-gate-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: hopgate
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+    ports:
+      # 로컬 개발용으로 필요하면 열고, 운영에서는 내부 네트워크만 사용 가능
+      - "5432:5432"
+
+volumes:
+  pgdata: {}
