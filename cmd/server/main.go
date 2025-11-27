@@ -462,6 +462,42 @@ func main() {
 		_ = os.Setenv("HOP_ACME_USE_STAGING", "true")
 	}
 
+	// HOP_ACME_STANDALONE_ONLY=true 인 경우, ACME 인증서만 발급/갱신하고 프로세스를 종료합니다.
+	// 이 모드는 HTTP/DTLS 서버를 띄우지 않고 lego(ACME client)만 단독으로 실행할 때 사용합니다.
+	standaloneOnly := func() bool {
+		v := strings.ToLower(strings.TrimSpace(os.Getenv("HOP_ACME_STANDALONE_ONLY")))
+		switch v {
+		case "1", "true", "yes", "y", "on":
+			return true
+		default:
+			return false
+		}
+	}()
+	if standaloneOnly {
+		logger.Info("running ACME standalone-only mode", logging.Fields{
+			"domains":     domains,
+			"use_staging": cfg.Debug,
+		})
+
+		// ACME(lego) 매니저 초기화: 도메인 DNS 확인 + 인증서 확보/갱신 + 캐시 저장
+		// 이 호출이 끝나면 해당 도메인에 대한 인증서가 HOP_ACME_CACHE_DIR 에 준비되어 있어야 합니다.
+		acmeCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		defer cancel()
+
+		if _, err := acme.NewLegoManagerFromEnv(acmeCtx, logger, domains); err != nil {
+			logger.Error("acme standalone mode failed", logging.Fields{
+				"error":   err.Error(),
+				"domains": domains,
+			})
+			os.Exit(1)
+		}
+
+		logger.Info("acme standalone mode completed successfully, exiting process", logging.Fields{
+			"domains": domains,
+		})
+		return
+	}
+
 	// ACME(lego) 매니저 초기화: 도메인 DNS 확인 + 인증서 확보/갱신 + 캐시 저장
 	acmeMgr, err := acme.NewLegoManagerFromEnv(ctx, logger, domains)
 	if err != nil {
