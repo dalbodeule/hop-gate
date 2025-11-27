@@ -1,0 +1,6 @@
+name: "Issue Templates"
+blank_issues_enabled: false
+contact_links:
+  - name: "Questions / Q&A / 질문"
+    url: "https://github.com/dalbodeule/hop-gate/discussions"
+    about: "For simple questions or discussions, please use GitHub Discussions. / 단순 질문이나 토론은 GitHub Discussions를 사용해주세요."

@@ -1,0 +1,59 @@
+name: "💡 Feature Request"
+description: "Issue template for proposing new features / 새 기능 제안을 위한 이슈 템플릿"
+labels: ["enhancement"]
+title: "[Feature] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for proposing a new idea or feature.
+        Please fill out the form below as clearly and in as much detail as possible.
+
+        새로운 아이디어 제안 감사합니다!
+        아래 양식을 가능한 한 자세히, 명확하게 작성해주세요.
+  - type: input
+    id: summary
+    attributes:
+      label: Feature summary / 제안 요약
+      description: Describe the feature in one sentence. / 한 줄로 제안하시는 기능을 설명해주세요.
+      placeholder: e.g. Support custom routing rules per domain / 예) 특정 도메인별 커스텀 라우팅 규칙 지원
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Problem / Motivation / 문제 / 동기
+      description: Explain why this feature is needed and what problem it solves. / 왜 이 기능이 필요한지, 어떤 문제를 해결하는지 설명해주세요.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution / 제안하는 해결 방법
+      description: Describe your proposed solution in as much detail as possible. / 가능한 한 구체적으로 작성해주세요.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered / 고려한 대안들
+      description: List any alternatives you have tried or considered. / 이미 시도했거나 생각해본 다른 방법이 있다면 적어주세요.
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact / 영향 범위
+      description: Describe the impact on API, configuration, deployment, security, performance, etc. / API, 설정, 배포, 보안, 성능 등에 어떤 영향이 있을지 적어주세요.
+  - type: input
+    id: version
+    attributes:
+      label: Current hop-gate version / commit / 현재 사용 중인 hop-gate 버전 / 커밋
+      placeholder: e.g. v0.1.0, 0123abcd / 예) v0.1.0, 0123abcd
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority (self-assessed) / 우선순위 (자체 평가)
+      options:
+        - Low / 낮음
+        - Medium / 보통
+        - High / 높음
+        - Very high / 매우 높음

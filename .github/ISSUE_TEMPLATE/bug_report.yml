@@ -1,0 +1,66 @@
+name: "🐞 Bug Report"
+description: "Issue template for reporting bugs / 버그 신고를 위한 이슈 템플릿"
+labels: ["bug"]
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for taking the time to report a bug.
+        Please fill out the form below as clearly and in as much detail as possible.
+
+        감사합니다! 아래 양식을 가능한 한 자세히, 명확하게 작성해주세요.
+  - type: input
+    id: summary
+    attributes:
+      label: Bug summary / 버그 요약
+      description: Describe the bug in one sentence. / 한 줄로 버그를 설명해주세요.
+      placeholder: e.g. TLS handshake fails for a specific domain / 예) 특정 도메인에서 TLS 핸드셰이크 실패
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce / 재현 절차
+      description: List the steps to reproduce the bug in order. / 버그를 재현하기 위한 단계를 순서대로 적어주세요.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior / 기대한 동작
+      description: What did you expect to happen? / 어떤 동작을 기대하셨나요?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior / 실제 동작
+      description: What actually happened instead? / 실제로는 어떻게 동작했나요?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: hop-gate version / commit / hop-gate 버전 / 커밋
+      placeholder: e.g. v0.1.0, 0123abcd / 예) v0.1.0, 0123abcd
+  - type: dropdown
+    id: env
+    attributes:
+      label: Environment / 실행 환경
+      multiple: true
+      options:
+        - macOS
+        - Linux
+        - Docker
+        - Other / 기타
+  - type: textarea
+    id: logs
+    attributes:
+      label: Related logs & stack traces / 관련 로그 및 스택트레이스
+      description: Please remove any sensitive information before attaching. / 민감한 정보는 제거 후 첨부해주세요.
+      render: shell
