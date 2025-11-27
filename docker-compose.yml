@@ -25,9 +25,9 @@ services:
 
     ports:
       # 외부 80/443 → 컨테이너 8080/8443 매핑 (예: .env.example 기준)
-      - "80:8080"        # HTTP
-      - "443:8443"       # HTTPS (TCP)
-      - "443:8443/udp"   # DTLS (UDP)
+      - "80:80"        # HTTP
+      - "443:443"       # HTTPS (TCP)
+      - "443:443/udp"   # DTLS (UDP)
 
     volumes:
       # ACME 인증서/계정 캐시 디렉터리 (호스트에 지속 보관)
