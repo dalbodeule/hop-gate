@@ -32,7 +32,7 @@ This document tracks implementation progress against the HopGate architecture an
   - `[type] short description [BREAK]` 형식, 타입 우선순위 정의, BREAK 규칙. (ko/en)  
   - Defines commit message format, type priorities, and `[BREAK]` convention. (en)
 
-- 아키텍처 그림용 프롬프트: [`arkitecture.prompt`](arkitecture.prompt)  
+- 아키텍처 그림용 프롬프트: [`architecture.prompt`](images/architecture.prompt)  
   - 외부 도구(예: 나노바나나 Pro)가 참조할 상세 다이어그램 지침. (en 설명 위주)  
 
 ---
@@ -213,20 +213,23 @@ This document tracks implementation progress against the HopGate architecture an
 - [x] 서버 main 에 ACME 기반 `*tls.Config` 주입
   - DTLS / HTTPS 리스너에 ACME 인증서 적용 (Debug 모드에서는 DTLS 에 self-signed, HTTPS 에 ACME 사용).
 
-- [ ] TLS-ALPN-01 챌린지 및 운영 전략 보완
-  - 필요 시 TLS-ALPN-01 챌린지 처리 로직 추가.
-  - 운영/테스트 환경 분리에 대한 문서화 및 구성 정교화.
+- [ ] ACME 고급 기능 및 운영 전략 보완
+  - TLS-ALPN-01 챌린지 지원 여부 검토 및 필요 시 lego 설정/핸들러 추가.
+  - 인증서 발급/갱신 실패 시 재시도/백오프 및 경고 로그/알림을 포함한 에러 처리 전략 정의.
+  - Debug(스테이징 CA) / Production(실 CA) 환경 전환 플로우와 도메인/환경별 ACME 설정 매트릭스를 문서화.
 
 ---
 
 ### 3.5 Observability / 관측성
 
-- [ ] Prometheus 메트릭 노출  
-  - `/metrics` 엔드포인트 추가.  
-  - DTLS 세션 수, 요청 수, 에러 수 등 카운터/게이지 정의.  
+- [ ] Prometheus 메트릭 노출 및 서버 wiring
+  - `cmd/server/main.go` 에 Prometheus `/metrics` 엔드포인트 추가 (예: promhttp.Handler).
+  - DTLS 세션 수, DTLS 핸드셰이크 성공/실패 수, HTTP/Proxy 요청 수 및 에러 수에 대한 카운터/게이지 메트릭 정의.
+  - 도메인, 클라이언트 ID, request_id 등의 라벨 설계 및 현재 구조적 로깅 필드와 일관성 유지.
 
-- [ ] Loki/Grafana 대시보드 템플릿 초안 작성  
-  - 주요 필터(도메인, 클라이언트 ID, request_id) 기준 쿼리 예시.  
+- [ ] Loki/Grafana 대시보드 및 쿼리 예시
+  - Loki/Promtail 구성을 가정한 주요 로그 쿼리 예시 정리(도메인, 클라이언트 ID, request_id 기준).
+  - Prometheus 메트릭 기반 기본 대시보드 템플릿 작성 (DTLS 상태, 프록시 트래픽, 에러율 등).
 
 ---
 

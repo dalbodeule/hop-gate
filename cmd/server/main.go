@@ -9,14 +9,18 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/dalbodeule/hop-gate/internal/acme"
 	"github.com/dalbodeule/hop-gate/internal/config"
 	"github.com/dalbodeule/hop-gate/internal/dtls"
 	"github.com/dalbodeule/hop-gate/internal/logging"
+	"github.com/dalbodeule/hop-gate/internal/observability"
 	"github.com/dalbodeule/hop-gate/internal/protocol"
 	"github.com/dalbodeule/hop-gate/internal/store"
 )
@@ -126,6 +130,45 @@ var (
 	sessionsByDomain = make(map[string]*dtlsSessionWrapper)
 )
 
+// statusRecorder 는 HTTP 응답 상태 코드를 캡처하기 위한 래퍼입니다.
+// Prometheus 메트릭에서 status 라벨을 기록하는 데 사용합니다.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusRecorder) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// hostDomainHandler 는 HOP_SERVER_DOMAIN 에 지정된 도메인으로만 요청을 허용하는 래퍼입니다.
+// Host 헤더에서 포트를 제거한 뒤 소문자 비교를 수행합니다.
+func hostDomainHandler(allowedDomain string, logger logging.Logger, next http.Handler) http.Handler {
+	allowed := strings.ToLower(strings.TrimSpace(allowedDomain))
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if allowed != "" {
+			host := r.Host
+			if i := strings.Index(host, ":"); i != -1 {
+				host = host[:i]
+			}
+			host = strings.ToLower(strings.TrimSpace(host))
+			if host != allowed {
+				logger.Warn("rejecting request due to mismatched host", logging.Fields{
+					"allowed_domain": allowed,
+					"request_host":   host,
+					"path":           r.URL.Path,
+				})
+				// 메트릭/관리용 엔드포인트에 대해 호스트가 다르면 404 로 응답하여 노출을 최소화합니다.
+				http.NotFound(w, r)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func registerSessionForDomain(domain string, sess dtls.Session, logger logging.Logger) {
 	d := strings.ToLower(strings.TrimSpace(domain))
 	if d == "" {
@@ -163,20 +206,37 @@ func newHTTPHandler(logger logging.Logger) http.Handler {
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		method := r.Method
+
+		// 상태 코드 캡처를 위한 래퍼
+		sr := &statusRecorder{
+			ResponseWriter: w,
+			status:         http.StatusOK,
+		}
+
 		log := logger.With(logging.Fields{
 			"component": "http_entry",
-			"method":    r.Method,
+			"method":    method,
 			"url":       r.URL.String(),
 			"host":      r.Host,
 		})
 		log.Info("incoming http request", nil)
+
+		// 요청 단위 Prometheus 메트릭 기록
+		defer func() {
+			elapsed := time.Since(start).Seconds()
+			statusCode := sr.status
+			observability.HTTPRequestsTotal.WithLabelValues(method, strconv.Itoa(statusCode)).Inc()
+			observability.HTTPRequestDurationSeconds.WithLabelValues(method).Observe(elapsed)
+		}()
 
 		// 1. ACME HTTP-01 webroot handling
 		// /.well-known/acme-challenge/{token} 는 HOP_ACME_WEBROOT 디렉터리에서 정적 파일로 서빙합니다.
 		if webroot != "" && strings.HasPrefix(r.URL.Path, "/.well-known/acme-challenge/") {
 			token := strings.Trim(r.URL.Path, "/")
 			if token == "" {
-				http.Error(w, "invalid acme challenge path", http.StatusBadRequest)
+				observability.ProxyErrorsTotal.WithLabelValues("acme_http01_error").Inc()
+				http.Error(sr, "invalid acme challenge path", http.StatusBadRequest)
 				return
 			}
 			filePath := filepath.Join(webroot, token)
@@ -195,17 +255,19 @@ func newHTTPHandler(logger logging.Logger) http.Handler {
 				log.Error("failed to open acme challenge file", logging.Fields{
 					"error": err.Error(),
 				})
-				http.NotFound(w, r)
+				observability.ProxyErrorsTotal.WithLabelValues("acme_http01_error").Inc()
+				http.NotFound(sr, r)
 				return
 			}
 			defer f.Close()
 
 			// ACME challenge 응답은 일반적으로 text/plain.
-			w.Header().Set("Content-Type", "text/plain")
-			if _, err := io.Copy(w, f); err != nil {
+			sr.Header().Set("Content-Type", "text/plain")
+			if _, err := io.Copy(sr, f); err != nil {
 				log.Error("failed to write acme challenge response", logging.Fields{
 					"error": err.Error(),
 				})
+				observability.ProxyErrorsTotal.WithLabelValues("acme_http01_error").Inc()
 			}
 			return
 		}
@@ -219,7 +281,8 @@ func newHTTPHandler(logger logging.Logger) http.Handler {
 			log.Warn("no dtls session for host", logging.Fields{
 				"host": r.Host,
 			})
-			http.Error(w, "no backend client available", http.StatusBadGateway)
+			observability.ProxyErrorsTotal.WithLabelValues("no_dtls_session").Inc()
+			http.Error(sr, "no backend client available", http.StatusBadGateway)
 			return
 		}
 
@@ -232,22 +295,23 @@ func newHTTPHandler(logger logging.Logger) http.Handler {
 			log.Error("forward over dtls failed", logging.Fields{
 				"error": err.Error(),
 			})
-			http.Error(w, "dtls forward failed", http.StatusBadGateway)
+			observability.ProxyErrorsTotal.WithLabelValues("dtls_forward_failed").Inc()
+			http.Error(sr, "dtls forward failed", http.StatusBadGateway)
 			return
 		}
 
 		// 응답 헤더/바디 복원
 		for k, vs := range protoResp.Header {
 			for _, v := range vs {
-				w.Header().Add(k, v)
+				sr.Header().Add(k, v)
 			}
 		}
 		if protoResp.Status == 0 {
 			protoResp.Status = http.StatusOK
 		}
-		w.WriteHeader(protoResp.Status)
+		sr.WriteHeader(protoResp.Status)
 		if len(protoResp.Body) > 0 {
-			if _, err := w.Write(protoResp.Body); err != nil {
+			if _, err := sr.Write(protoResp.Body); err != nil {
 				log.Warn("failed to write http response body", logging.Fields{
 					"error": err.Error(),
 				})
@@ -264,6 +328,9 @@ func newHTTPHandler(logger logging.Logger) http.Handler {
 
 func main() {
 	logger := logging.NewStdJSONLogger("server")
+
+	// Prometheus 메트릭 등록
+	observability.MustRegister()
 
 	// 1. 서버 설정 로드 (.env + 환경변수)
 	cfg, err := config.LoadServerConfigFromEnv()
@@ -396,10 +463,19 @@ func main() {
 	// 5. HTTP / HTTPS 서버 시작
 	httpHandler := newHTTPHandler(logger)
 
+	// Prometheus /metrics 엔드포인트 및 메인 핸들러를 위한 mux 구성
+	httpMux := http.NewServeMux()
+	allowedDomain := strings.ToLower(strings.TrimSpace(cfg.Domain))
+
+	// /metrics 는 HOP_SERVER_DOMAIN 에 지정된 도메인으로만 접근 가능하도록 제한합니다.
+	// Admin Plane HTTP mux 도 이후 hostDomainHandler 를 통해 동일하게 제한해야 합니다.
+	httpMux.Handle("/metrics", hostDomainHandler(allowedDomain, logger, promhttp.Handler()))
+	httpMux.Handle("/", httpHandler)
+
 	// HTTP: 평문 포트
 	httpSrv := &http.Server{
 		Addr:    cfg.HTTPListen,
-		Handler: httpHandler,
+		Handler: httpMux,
 	}
 	go func() {
 		logger.Info("http server listening", logging.Fields{
@@ -415,7 +491,7 @@ func main() {
 	// HTTPS: ACME 기반 TLS 사용 (debug 모드에서도 ACME tls config 사용 가능)
 	httpsSrv := &http.Server{
 		Addr:      cfg.HTTPSListen,
-		Handler:   httpHandler,
+		Handler:   httpMux,
 		TLSConfig: acmeTLSCfg,
 	}
 	go func() {
@@ -435,7 +511,7 @@ func main() {
 	}
 
 	// DTLS 핸드셰이크 단계에서 HOP_SERVER_DOMAIN 으로 설정된 도메인만 허용하도록 래핑합니다.
-	allowedDomain := strings.ToLower(strings.TrimSpace(cfg.Domain))
+	allowedDomain = strings.ToLower(strings.TrimSpace(cfg.Domain))
 	var validator dtls.DomainValidator = &domainGateValidator{
 		allowed: allowedDomain,
 		inner:   baseValidator,
@@ -458,6 +534,9 @@ func main() {
 			// 세션 종료/타임아웃 관리는 별도의 세션 매니저(TODO)에서 담당해야 합니다.
 			hsRes, err := dtls.PerformServerHandshake(ctx, s, validator, logger)
 			if err != nil {
+				// 핸드셰이크 실패 메트릭 기록
+				observability.DTLSHandshakesTotal.WithLabelValues("failure").Inc()
+
 				// PerformServerHandshake 내부에서 이미 상세 로그를 남기므로 여기서는 요약만 기록합니다.
 				logger.Warn("dtls handshake failed", logging.Fields{
 					"session_id": s.ID(),
@@ -468,6 +547,9 @@ func main() {
 				_ = s.Close()
 				return
 			}
+
+			// Handshake 성공 메트릭 기록
+			observability.DTLSHandshakesTotal.WithLabelValues("success").Inc()
 
 			// Handshake 성공: 서버 측은 어떤 도메인이 연결되었는지 알 수 있습니다.
 			logger.Info("dtls handshake completed", logging.Fields{
