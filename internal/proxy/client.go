@@ -51,10 +51,10 @@ func NewClientProxy(logger logging.Logger, localTarget string) *ClientProxy {
 	}
 }
 
-// StartLoop 는 DTLS 세션에서 protocol.Request 를 읽고 로컬 HTTP 요청을 수행한 뒤
-// protocol.Response 를 다시 세션으로 쓰는 루프를 실행합니다. (ko)
-// StartLoop reads protocol.Request messages from the DTLS session, performs local HTTP
-// requests, and writes back protocol.Response objects. (en)
+// StartLoop 는 DTLS 세션에서 protocol.Envelope 를 읽고, HTTP 요청의 경우 로컬 HTTP 요청을 수행한 뒤
+// protocol.Envelope(HTTP 응답 포함)을 다시 세션으로 쓰는 루프를 실행합니다. (ko)
+// StartLoop reads protocol.Envelope messages from the DTLS session; for HTTP messages it
+// performs local HTTP requests and writes back HTTP responses wrapped in an Envelope. (en)
 func (p *ClientProxy) StartLoop(ctx context.Context, sess dtls.Session) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -74,17 +74,27 @@ func (p *ClientProxy) StartLoop(ctx context.Context, sess dtls.Session) error {
 		default:
 		}
 
-		var req protocol.Request
-		if err := dec.Decode(&req); err != nil {
+		var env protocol.Envelope
+		if err := dec.Decode(&env); err != nil {
 			if err == io.EOF {
 				log.Info("dtls session closed by server", nil)
 				return nil
 			}
-			log.Error("failed to decode protocol request", logging.Fields{
+			log.Error("failed to decode protocol envelope", logging.Fields{
 				"error": err.Error(),
 			})
 			return err
 		}
+
+		// 현재는 HTTP 타입만 지원하며, 그 외 타입은 에러로 처리합니다.
+		if env.Type != protocol.MessageTypeHTTP || env.HTTPRequest == nil {
+			log.Error("received unsupported envelope type from server", logging.Fields{
+				"type": env.Type,
+			})
+			return fmt.Errorf("unsupported envelope type %q or missing http_request", env.Type)
+		}
+
+		req := env.HTTPRequest
 
 		start := time.Now()
 		logReq := log.With(logging.Fields{
@@ -95,7 +105,7 @@ func (p *ClientProxy) StartLoop(ctx context.Context, sess dtls.Session) error {
 			"client_id":    req.ClientID,
 			"local_target": p.LocalTarget,
 		})
-		logReq.Info("received protocol request from server", nil)
+		logReq.Info("received http envelope from server", nil)
 
 		resp := protocol.Response{
 			RequestID: req.RequestID,
@@ -103,7 +113,7 @@ func (p *ClientProxy) StartLoop(ctx context.Context, sess dtls.Session) error {
 		}
 
 		// 로컬 HTTP 요청 수행
-		if err := p.forwardToLocal(ctx, &req, &resp); err != nil {
+		if err := p.forwardToLocal(ctx, req, &resp); err != nil {
 			resp.Status = http.StatusBadGateway
 			resp.Error = err.Error()
 			logReq.Error("local http request failed", logging.Fields{
@@ -111,14 +121,20 @@ func (p *ClientProxy) StartLoop(ctx context.Context, sess dtls.Session) error {
 			})
 		}
 
-		if err := enc.Encode(&resp); err != nil {
-			logReq.Error("failed to encode protocol response", logging.Fields{
+		// HTTP 응답을 Envelope 로 감싸서 서버로 전송합니다.
+		respEnv := protocol.Envelope{
+			Type:         protocol.MessageTypeHTTP,
+			HTTPResponse: &resp,
+		}
+
+		if err := enc.Encode(&respEnv); err != nil {
+			logReq.Error("failed to encode http response envelope", logging.Fields{
 				"error": err.Error(),
 			})
 			return err
 		}
 
-		logReq.Info("protocol response sent to server", logging.Fields{
+		logReq.Info("http response envelope sent to server", logging.Fields{
 			"status":     resp.Status,
 			"elapsed_ms": time.Since(start).Milliseconds(),
 			"error":      resp.Error,

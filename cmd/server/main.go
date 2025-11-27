@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -78,7 +79,7 @@ func (w *dtlsSessionWrapper) ForwardHTTP(ctx context.Context, logger logging.Log
 	// 간단한 RequestID 생성 (실제 서비스에서는 UUID 등을 사용하는 것이 좋음)
 	requestID := time.Now().UTC().Format("20060102T150405.000000000")
 
-	protoReq := &protocol.Request{
+	httpReq := &protocol.Request{
 		RequestID:   requestID,
 		ClientID:    "", // TODO: 클라이언트 식별자 도입 시 채우기
 		ServiceName: serviceName,
@@ -100,29 +101,45 @@ func (w *dtlsSessionWrapper) ForwardHTTP(ctx context.Context, logger logging.Log
 		"scheme": req.URL.Scheme,
 	})
 
+	// HTTP 요청을 Envelope 로 감싸서 전송합니다.
+	env := &protocol.Envelope{
+		Type:        protocol.MessageTypeHTTP,
+		HTTPRequest: httpReq,
+	}
+
 	enc := json.NewEncoder(w.sess)
-	if err := enc.Encode(protoReq); err != nil {
-		log.Error("failed to encode protocol request", logging.Fields{
+	if err := enc.Encode(env); err != nil {
+		log.Error("failed to encode http envelope", logging.Fields{
 			"error": err.Error(),
 		})
 		return nil, err
 	}
 
-	var protoResp protocol.Response
+	// 클라이언트로부터 HTTP 응답 Envelope 를 수신합니다.
+	var respEnv protocol.Envelope
 	dec := json.NewDecoder(w.sess)
-	if err := dec.Decode(&protoResp); err != nil {
-		log.Error("failed to decode protocol response", logging.Fields{
+	if err := dec.Decode(&respEnv); err != nil {
+		log.Error("failed to decode http envelope", logging.Fields{
 			"error": err.Error(),
 		})
 		return nil, err
 	}
+
+	if respEnv.Type != protocol.MessageTypeHTTP || respEnv.HTTPResponse == nil {
+		log.Error("received non-http envelope from client", logging.Fields{
+			"type": respEnv.Type,
+		})
+		return nil, fmt.Errorf("unexpected envelope type %q or empty http_response", respEnv.Type)
+	}
+
+	protoResp := respEnv.HTTPResponse
 
 	log.Info("received dtls response", logging.Fields{
 		"status": protoResp.Status,
 		"error":  protoResp.Error,
 	})
 
-	return &protoResp, nil
+	return protoResp, nil
 }
 
 var (
@@ -140,6 +157,36 @@ type statusRecorder struct {
 func (w *statusRecorder) WriteHeader(code int) {
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
+}
+
+// hopGateOwnedHeaders 는 HopGate 서버가 스스로 관리하는 응답 헤더 목록입니다. (ko)
+// hopGateOwnedHeaders lists response headers that are owned by the HopGate server. (en)
+var hopGateOwnedHeaders = map[string]struct{}{
+	"X-HopGate-Server":          {},
+	"Strict-Transport-Security": {},
+	"X-Content-Type-Options":    {},
+	"Referrer-Policy":           {},
+}
+
+// setSecurityAndIdentityHeaders 는 HopGate 에서 공통으로 추가하는 보안/식별 헤더를 설정합니다. (ko)
+// setSecurityAndIdentityHeaders configures common security and identity headers for HopGate. (en)
+func setSecurityAndIdentityHeaders(w http.ResponseWriter, r *http.Request) {
+	h := w.Header()
+
+	// HopGate 로 구성된 서버임을 나타내는 식별 헤더 (ko)
+	// Header to indicate that this server is powered by HopGate. (en)
+	h.Set("X-HopGate-Server", "hop-gate")
+
+	// 기본 보안 헤더 설정 (ko)
+	// Basic security headers (best-effort). (en)
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+
+	// HTTPS 요청에 대해서만 HSTS 헤더를 추가합니다. (ko)
+	// Only send HSTS for HTTPS requests. (en)
+	if r != nil && r.TLS != nil {
+		h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
+	}
 }
 
 // hostDomainHandler 는 HOP_SERVER_DOMAIN 에 지정된 도메인으로만 요청을 허용하는 래퍼입니다.
@@ -213,6 +260,9 @@ func newHTTPHandler(logger logging.Logger) http.Handler {
 			ResponseWriter: w,
 			status:         http.StatusOK,
 		}
+		// 보안/식별 헤더를 공통으로 설정합니다. (ko)
+		// Configure common security and identity headers. (en)
+		setSecurityAndIdentityHeaders(sr, r)
 
 		log := logger.With(logging.Fields{
 			"component": "http_entry",
@@ -286,6 +336,29 @@ func newHTTPHandler(logger logging.Logger) http.Handler {
 			return
 		}
 
+		// 원본 클라이언트 IP를 X-Forwarded-For / X-Real-IP 헤더로 전달합니다. (ko)
+		// Forward original client IP via X-Forwarded-For / X-Real-IP headers. (en)
+		if r.RemoteAddr != "" {
+			remoteIP := r.RemoteAddr
+			if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+				remoteIP = ip
+			}
+			if remoteIP != "" {
+				// X-Forwarded-For 는 기존 값 뒤에 원본 IP를 추가합니다. (ko)
+				// Append original IP to X-Forwarded-For if present. (en)
+				if prior := r.Header.Get("X-Forwarded-For"); prior == "" {
+					r.Header.Set("X-Forwarded-For", remoteIP)
+				} else {
+					r.Header.Set("X-Forwarded-For", prior+", "+remoteIP)
+				}
+				// X-Real-IP 가 비어있는 경우에만 설정합니다. (ko)
+				// Set X-Real-IP only if it is not already set. (en)
+				if r.Header.Get("X-Real-IP") == "" {
+					r.Header.Set("X-Real-IP", remoteIP)
+				}
+			}
+		}
+
 		// r.Body 는 ForwardHTTP 내에서 읽고 닫지 않으므로 여기서 닫기
 		defer r.Body.Close()
 
@@ -302,6 +375,11 @@ func newHTTPHandler(logger logging.Logger) http.Handler {
 
 		// 응답 헤더/바디 복원
 		for k, vs := range protoResp.Header {
+			// HopGate 가 소유한 보안/식별 헤더는 백엔드 값 대신 서버 값만 사용합니다. (ko)
+			// For security/identity headers owned by HopGate, ignore backend values. (en)
+			if _, ok := hopGateOwnedHeaders[http.CanonicalHeaderKey(k)]; ok {
+				continue
+			}
 			for _, v := range vs {
 				sr.Header().Add(k, v)
 			}
