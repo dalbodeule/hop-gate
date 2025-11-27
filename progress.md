@@ -185,33 +185,37 @@ This document tracks implementation progress against the HopGate architecture an
 
 ### 3.3 Proxy Core / HTTP Tunneling
 
-- [ ] 서버 측 Proxy 구현 확장: [`internal/proxy/server.go`](internal/proxy/server.go)  
-  - HTTP/HTTPS 리스너와 DTLS 세션 매핑 구현.  
-  - `Router` 구현체 추가 (도메인/패스 → 클라이언트/서비스).  
-  - 요청/응답을 `internal/protocol` 구조체로 직렬화/역직렬화.  
+- [x] 서버 측 Proxy 구현 확장: [`internal/proxy/server.go`](internal/proxy/server.go)
+  - HTTP/HTTPS 리스너와 DTLS 세션 매핑 구현.
+  - `Router` 구현체 추가 (도메인/패스 → 클라이언트/서비스).
+  - 요청/응답을 `internal/protocol` 구조체로 직렬화/역직렬화.
 
-- [ ] 클라이언트 측 Proxy 구현 확장: [`internal/proxy/client.go`](internal/proxy/client.go)  
-  - DTLS 세션에서 `protocol.Request` 수신 → 로컬 HTTP 호출 → `protocol.Response` 전송 루프 구현.  
-  - timeout/취소/에러 처리.  
+- [x] 클라이언트 측 Proxy 구현 확장: [`internal/proxy/client.go`](internal/proxy/client.go)
+  - DTLS 세션에서 `protocol.Request` 수신 → 로컬 HTTP 호출 → `protocol.Response` 전송 루프 구현.
+  - timeout/취소/에러 처리.
 
-- [ ] 서버 main 에 Proxy wiring 추가: [`cmd/server/main.go`](cmd/server/main.go)  
-  - DTLS handshake 완료된 세션을 Proxy 라우팅 테이블에 등록.  
-  - HTTPS 서버와 Proxy 핸들러 연결.  
+- [x] 서버 main 에 Proxy wiring 추가: [`cmd/server/main.go`](cmd/server/main.go)
+  - DTLS handshake 완료된 세션을 Proxy 라우팅 테이블에 등록.
+  - HTTPS 서버와 Proxy 핸들러 연결.
 
-- [ ] 클라이언트 main 에 Proxy loop wiring 추가: [`cmd/client/main.go`](cmd/client/main.go)  
-  - handshake 성공 후 `proxy.ClientProxy.StartLoop` 실행.  
+- [x] 클라이언트 main 에 Proxy loop wiring 추가: [`cmd/client/main.go`](cmd/client/main.go)
+  - handshake 성공 후 `proxy.ClientProxy.StartLoop` 실행.
 
 ---
 
 ### 3.4 ACME Integration / ACME 연동
 
-- [ ] [`internal/acme/acme.go`](internal/acme/acme.go) 실제 구현  
-  - certmagic 또는 lego 기반 ACME 매니저 구현.  
-  - 메인 도메인 + 프록시 도메인용 인증서 발급/갱신.  
-  - HTTP-01/TLS-ALPN-01 챌린지 처리.  
+- [x] [`internal/acme/acme.go`](internal/acme/acme.go) 실제 구현
+  - lego 기반 ACME 매니저 구현.
+  - 메인 도메인 + 프록시 도메인용 인증서 발급/갱신.
+  - HTTP-01 챌린지 처리(webroot 방식).
 
-- [ ] 서버 main 에 ACME 기반 `*tls.Config` 주입  
-  - DTLS / HTTPS 리스너에 ACME 인증서 적용 (Debug 모드 예외).  
+- [x] 서버 main 에 ACME 기반 `*tls.Config` 주입
+  - DTLS / HTTPS 리스너에 ACME 인증서 적용 (Debug 모드에서는 DTLS 에 self-signed, HTTPS 에 ACME 사용).
+
+- [ ] TLS-ALPN-01 챌린지 및 운영 전략 보완
+  - 필요 시 TLS-ALPN-01 챌린지 처리 로직 추가.
+  - 운영/테스트 환경 분리에 대한 문서화 및 구성 정교화.
 
 ---
 
@@ -228,15 +232,19 @@ This document tracks implementation progress against the HopGate architecture an
 
 ### 3.6 Hardening / 안정성 & 구성
 
-- [ ] 설정 유효성 검사 추가  
-  - 필수 env 누락/오류에 대한 명확한 에러 메시지.  
+- [ ] 설정 유효성 검사 추가
+  - 필수 env 누락/오류에 대한 명확한 에러 메시지.
 
-- [ ] 에러 처리/재시도 정책  
-  - DTLS 재연결, Proxy 재시도, DB 재시도 정책 정의.  
+- [ ] 에러 처리/재시도 정책
+  - DTLS 재연결, Proxy 재시도, DB 재시도 정책 정의.
 
-- [ ] 보안 검토  
-  - Admin API 인증 방식 재검토 (예: IP allowlist, 추가 인증 수단).  
-  - 클라이언트 API Key 저장/회전 전략.  
+- [ ] 보안 검토
+  - Admin API 인증 방식 재검토 (예: IP allowlist, 추가 인증 수단).
+  - 클라이언트 API Key 저장/회전 전략.
+
+- [ ] Proxy 서버 추상화 및 Router 리팩터링
+  - `internal/proxy/server.go` 의 `ServerProxy` 및 `Router` 인터페이스를 실제 HTTP ↔ DTLS 터널링 경로에 적용.
+  - 현재 `cmd/server/main.go` 에 위치한 Proxy 코어 로직을 proxy 레이어로 이동.
 
 ---
 
@@ -257,9 +265,9 @@ This document tracks implementation progress against the HopGate architecture an
 
 ### Milestone 3 — ACME + TLS/DTLS 정식 인증
 
-- [ ] ACME 매니저 구현 (certmagic/lego).  
-- [ ] HTTPS/DTLS 리스너에 ACME 인증서 주입.  
-- [ ] Debug 모드(self-signed)와 Production 모드(ACME) 전환 전략 정리.  
+- [x] ACME 매니저 구현 (lego 기반).
+- [x] HTTPS/DTLS 리스너에 ACME 인증서 주입.
+- [ ] ACME 고급 기능 및 운영 전략 정리 (예: TLS-ALPN-01, 인증서 롤오버/장애 대응 전략).
 
 ### Milestone 4 — Observability & Hardening
 
