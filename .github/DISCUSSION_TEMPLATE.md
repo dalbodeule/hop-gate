@@ -1,119 +1,102 @@
-# GitHub Discussions Announcement Template / GitHub Discussions 공지 템플릿
+# GitHub Discussion Template / GitHub Discussion 템플릿
 
 <!--
-Use this template when creating an Announcement in GitHub Discussions.
-Copy-paste and edit the content as needed.
-GitHub currently does not support repository-based Discussion templates in .github.
-GitHub Discussions에서 Announcement를 작성할 때 사용하는 템플릿입니다.
-아래 내용을 복사해서 저장소의 Announcement에 붙여넣은 뒤 수정해서 사용하세요.
-현재 .github 디렉터리를 통한 Discussion 템플릿 연동은 지원되지 않습니다.
+This document describes what to include when you start a new GitHub Discussion.
+It is not automatically linked by GitHub; copy the structure and adapt it as needed.
+
+이 문서는 새로운 GitHub Discussion을 만들 때 어떤 내용을 포함하면 좋은지 설명합니다.
+GitHub에 자동으로 연결되는 템플릿은 아니며, 여기 구조를 참고해서 자유롭게 작성하면 됩니다.
 -->
 
-## Metadata / 메타데이터
+## 1. Title / 제목
 
-- **Category / 카테고리**: `Announcements`
-- **Status / 상태**: `Planned`, `In progress`, `Completed` (choose one) / (택1)
-- **Related Issue(s) / 관련 이슈**: #ISSUE_ID
-- **Related PR(s) / 관련 PR**: #PR_ID
-- **Target version / 대상 버전**: e.g. `v0.2.0`
+- Write a short, user-facing title that explains the topic.  
+  사용자가 이해하기 쉬운 짧은 제목을 적습니다.
+- Avoid internal-only abbreviations.  
+  내부에서만 통하는 약어 사용은 피해주세요.
 
----
+## 2. Type of discussion / 디스커션 유형
 
-## Title / 제목
+<!-- Choose one or more that best describe your discussion. / 가장 잘 맞는 유형을 하나 이상 선택하세요. -->
 
-<!-- Short, user-facing title / 사용자 입장에서 이해하기 쉬운 짧은 제목 -->
+- Question / 질문
+- Idea / RFC (proposal) / 아이디어 · RFC(제안)
+- Announcement draft / 공지 초안
+- Design discussion / 설계 논의
+- Process / workflow / 프로세스 · 워크플로
+
+## 3. Summary / 개요
 
 <!--
-EN: e.g. "Deprecation of legacy ACME endpoint"
-KO: 예) "기존 ACME 엔드포인트 지원 종료 안내"
+In 2–3 sentences, describe what this discussion is about and what you want to decide.
+이 디스커션이 무엇에 대한 것인지, 무엇을 결정하고 싶은지 2~3문장으로 요약합니다.
 -->
 
-## Summary / 개요
+## 4. Background & motivation / 배경 및 문제 의식
 
 <!--
-EN: 2–3 sentences describing what is changing and why it matters.
-KO: 무엇이, 왜 변경되는지 2–3문장으로 요약해주세요.
+Explain the context, current behavior, and why it is not sufficient.
+현재 상황(맥락)과 동작, 그리고 왜 충분하지 않은지 설명해주세요.
 -->
 
-- What is changing? / 무엇이 변경되나요?
-- Why are we changing it now? / 왜 지금 변경하나요?
-- Who is affected? / 누가 영향을 받나요?
+- Current situation / 현재 상황:
+- Problems or pain points / 문제점, 불편함:
+- Who is affected? / 누가 영향을 받나요?:
 
-## Details / 상세 내용
-
-### Motivation / 배경 및 목적
+## 5. Proposal or question details / 제안 또는 질문 상세
 
 <!--
-EN: Explain the background, problem, or motivation.
-KO: 이 변경의 배경, 문제 의식, 목표를 설명해주세요.
+If you are proposing a change, describe the idea as concretely as possible.
+If you are asking a question, describe what you have already tried.
+변경을 제안한다면 가능한 한 구체적으로 설명해주세요.
+질문이라면 이미 시도해 본 것들을 함께 적어주세요.
 -->
 
-### What is changing / 변경 사항
+- What do you propose or ask? / 무엇을 제안하거나, 무엇을 묻고 있나요?
+- How would it work in practice? / 실제로는 어떻게 동작하길 바라나요?
+- Example flows, API, or config (if any). / 예시 플로우, API, 설정 등이 있다면 적어주세요.
+
+## 6. Alternatives & prior art / 대안 및 참고 사례
 
 <!--
-EN: Describe the technical or behavioral changes in more detail.
-KO: 기술적/동작 측면에서 어떤 변화가 있는지 자세히 적어주세요.
+List alternative options you have considered and why you chose this direction.
+비슷한 다른 옵션들을 나열하고, 왜 이 방향을 선택했는지 설명해주세요.
 -->
 
-- [ ] Behavior change / 동작 변화
-- [ ] Configuration change / 설정 변경
-- [ ] API change / API 변경
-- [ ] Operational change (deployment, monitoring, etc.) / 운영 변경(배포, 모니터링 등)
+- Alternatives you considered / 고려했던 대안:
+- Pros & cons / 장단점:
+- Related tools, standards, or projects / 관련 도구, 표준, 프로젝트:
 
-### Timeline / 일정
+## 7. Impact / 영향 범위
 
 <!--
-EN: Include key dates (announcement, rollout, deprecation, removal).
-KO: 공지, 롤아웃, 사용 중단, 제거 예정일 등 주요 일정을 적어주세요.
+Explain which parts of the system and which users would be affected.
+시스템의 어떤 부분과 어떤 사용자가 영향을 받는지 설명해주세요.
 -->
 
-- Announcement date / 공지 일자: `YYYY-MM-DD`
-- Rollout start / 롤아웃 시작: `YYYY-MM-DD`
-- Deprecation date / 사용 중단 예정: `YYYY-MM-DD`
-- Removal date (if any) / 완전 제거 예정일(선택): `YYYY-MM-DD`
+- API / Public surface / API 및 외부 공개 인터페이스:
+- Configuration & deployment / 설정 및 배포:
+- Security & privacy / 보안 및 프라이버시:
+- Performance & reliability / 성능 및 안정성:
+- Developer experience / 운영 및 개발자 경험(DX):
 
-## Impact & Risks / 영향 및 리스크
+## 8. Open questions / 열린 질문
 
 <!--
-EN: Describe who is affected, possible regressions, and risk level.
-KO: 어떤 사용자가 영향을 받는지, 회귀 가능성과 리스크 수준을 설명해주세요.
+List questions you specifically want feedback on.
+피드백을 받고 싶은 구체적인 질문들을 적어주세요.
 -->
 
-- Affected components / 영향을 받는 컴포넌트:
-- Affected users / 영향을 받는 사용자 그룹:
-- Risk level / 리스크 수준: `Low`, `Medium`, `High`
+- Question 1:
+- Question 2:
 
-## Migration / Action items / 마이그레이션 및 필요한 조치
+## 9. Proposed next steps / 다음 단계 제안
 
 <!--
-EN: Provide clear step-by-step instructions for users.
-KO: 사용자가 따라 할 수 있는 단계별 가이드를 작성해주세요.
+Suggest what should happen after this discussion (e.g. PoC, spec, PR).
+이 디스커션 이후 어떤 다음 단계가 필요할지 제안해주세요 (예: PoC, 스펙 문서, PR 등).
 -->
 
-1. Step 1 / 1단계
-2. Step 2 / 2단계
-3. Step 3 / 3단계
-
-## How to give feedback / 피드백 방법
-
-<!--
-EN: Tell users where and how to give feedback (issue, discussion, etc.).
-KO: 피드백을 어디에, 어떻게 남기면 되는지 안내해주세요.
--->
-
-- Open an Issue: link / 이슈 생성 링크
-- Comment under this Announcement / 이 공지에 댓글로 남기기
-- Other channels (if any) / 기타 채널(있는 경우)
-
-## FAQ (optional) / 자주 묻는 질문 (선택)
-
-<!--
-EN: Add Q&A entries here as they appear.
-KO: 자주 나오는 질문과 답변을 여기에 모아주세요.
--->
-
-- **Q:**  
-  **A:**
-
-- **Q:**  
-  **A:**
+- Who will drive this forward? / 누가 이 작업을 주도하나요?
+- Expected timeline (rough) / 대략적인 일정:
+- Needed input or reviewers / 필요한 인풋·리뷰어:
