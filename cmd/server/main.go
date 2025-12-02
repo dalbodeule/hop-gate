@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -217,7 +218,15 @@ func (w *dtlsSessionWrapper) ForwardHTTP(ctx context.Context, logger logging.Log
 
 	// 클라이언트로부터 HTTP 응답 Envelope 를 수신합니다.
 	var respEnv protocol.Envelope
-	dec := json.NewDecoder(w.sess)
+
+	// NOTE: pion/dtls 는 복호화된 애플리케이션 데이터를 호출자가 제공한 버퍼에 채웁니다.
+	// 기본 JSON 디코더 버퍼만 사용하면 큰 HTTP 응답/Envelope 에서 "dtls: buffer too small"
+	// 오류가 발생할 수 있으므로, 충분히 큰 bufio.Reader(64KiB)를 사용합니다. (ko)
+	// NOTE: pion/dtls decrypts application data into the buffer provided by the caller.
+	// Using only the default JSON decoder buffer can cause "dtls: buffer too small"
+	// errors for large HTTP responses/envelopes, so we wrap the session with a
+	// reasonably large bufio.Reader (64KiB). (en)
+	dec := json.NewDecoder(bufio.NewReaderSize(w.sess, 64*1024))
 	if err := dec.Decode(&respEnv); err != nil {
 		log.Error("failed to decode http envelope", logging.Fields{
 			"error": err.Error(),
@@ -370,9 +379,15 @@ func getSessionForHost(host string) *dtlsSessionWrapper {
 	return sessionsByDomain[h]
 }
 
-func newHTTPHandler(logger logging.Logger) http.Handler {
+func newHTTPHandler(logger logging.Logger, proxyTimeout time.Duration) http.Handler {
 	// ACME webroot (for HTTP-01) is read from env; must match HOP_ACME_WEBROOT used by lego.
 	webroot := strings.TrimSpace(os.Getenv("HOP_ACME_WEBROOT"))
+
+	// HOP_SERVER_DOMAIN 은 관리/제어용 도메인으로 사용되며, 프록시 대상 도메인이 아닙니다.
+	// 이 도메인으로 직접 접근하는 일반 요청은 400 Bad Request 로 응답해야 합니다. (ko)
+	// HOP_SERVER_DOMAIN is used as the control/admin domain and is not a proxied
+	// origin. Plain HTTP requests to this host should return 400 Bad Request. (en)
+	allowedDomain := strings.ToLower(strings.TrimSpace(os.Getenv("HOP_SERVER_DOMAIN")))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// NOTE: /__hopgate_assets__/ 경로는 DTLS/백엔드와 무관하게 항상 정적 에셋만 서빙해야 합니다. (ko)
@@ -469,13 +484,35 @@ func newHTTPHandler(logger logging.Logger) http.Handler {
 		// 간단한 서비스 이름 결정: 우선 "web" 고정, 추후 Router 도입 시 개선.
 		serviceName := "web"
 
-		sessWrapper := getSessionForHost(r.Host)
+		// Host 헤더에서 포트를 제거하고 소문자로 정규화합니다.
+		host := r.Host
+		if i := strings.Index(host, ":"); i != -1 {
+			host = host[:i]
+		}
+		hostLower := strings.ToLower(strings.TrimSpace(host))
+
+		// HOP_SERVER_DOMAIN 로 들어온 일반 요청은 프록시 대상이 아니므로 400 으로 응답합니다. (ko)
+		// Plain requests to HOP_SERVER_DOMAIN are not proxied and should return 400. (en)
+		if allowedDomain != "" && hostLower == allowedDomain {
+			log.Warn("request to control domain is not proxied", logging.Fields{
+				"host":           r.Host,
+				"allowed_domain": allowedDomain,
+				"path":           r.URL.Path,
+			})
+			observability.ProxyErrorsTotal.WithLabelValues("invalid_control_domain_request").Inc()
+			writeErrorPage(sr, r, http.StatusBadRequest)
+			return
+		}
+
+		sessWrapper := getSessionForHost(hostLower)
 		if sessWrapper == nil {
 			log.Warn("no dtls session for host", logging.Fields{
 				"host": r.Host,
 			})
 			observability.ProxyErrorsTotal.WithLabelValues("no_dtls_session").Inc()
-			writeErrorPage(sr, r, errorpages.StatusTLSHandshakeFailed)
+			// 등록되지 않았거나 활성 세션이 없는 도메인으로의 요청은 404 로 응답합니다. (ko)
+			// Requests for hosts without an active DTLS session return 404. (en)
+			writeErrorPage(sr, r, http.StatusNotFound)
 			return
 		}
 
@@ -505,15 +542,58 @@ func newHTTPHandler(logger logging.Logger) http.Handler {
 		// r.Body 는 ForwardHTTP 내에서 읽고 닫지 않으므로 여기서 닫기
 		defer r.Body.Close()
 
+		// 서버 측에서 DTLS → 클라이언트 → 로컬 서비스까지의 전체 왕복 시간을 제한하기 위해
+		// 요청 컨텍스트에 타임아웃을 적용합니다. 기본값은 15초이며,
+		// HOP_SERVER_PROXY_TIMEOUT_SECONDS 로 재정의할 수 있습니다. (ko)
+		// Apply an overall timeout (default 15s, configurable via
+		// HOP_SERVER_PROXY_TIMEOUT_SECONDS) to the DTLS forward path so that
+		// excessively slow backends surface as gateway timeouts. (en)
 		ctx := r.Context()
-		protoResp, err := sessWrapper.ForwardHTTP(ctx, logger, r, serviceName)
-		if err != nil {
-			log.Error("forward over dtls failed", logging.Fields{
-				"error": err.Error(),
+		if proxyTimeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, proxyTimeout)
+			defer cancel()
+		}
+
+		type forwardResult struct {
+			resp *protocol.Response
+			err  error
+		}
+		resultCh := make(chan forwardResult, 1)
+
+		go func() {
+			select {
+			case <-ctx.Done():
+				// Context cancelled, do not proceed.
+				return
+			default:
+				resp, err := sessWrapper.ForwardHTTP(ctx, logger, r, serviceName)
+				resultCh <- forwardResult{resp: resp, err: err}
+			}
+		}()
+
+		var protoResp *protocol.Response
+
+		select {
+		case <-ctx.Done():
+			log.Error("forward over dtls timed out", logging.Fields{
+				"timeout_seconds": int64(proxyTimeout.Seconds()),
+				"error":           ctx.Err().Error(),
 			})
-			observability.ProxyErrorsTotal.WithLabelValues("dtls_forward_failed").Inc()
-			writeErrorPage(sr, r, errorpages.StatusTLSHandshakeFailed)
+			observability.ProxyErrorsTotal.WithLabelValues("dtls_forward_timeout").Inc()
+			writeErrorPage(sr, r, errorpages.StatusGatewayTimeout)
 			return
+
+		case res := <-resultCh:
+			if res.err != nil {
+				log.Error("forward over dtls failed", logging.Fields{
+					"error": res.err.Error(),
+				})
+				observability.ProxyErrorsTotal.WithLabelValues("dtls_forward_failed").Inc()
+				writeErrorPage(sr, r, errorpages.StatusTLSHandshakeFailed)
+				return
+			}
+			protoResp = res.resp
 		}
 
 		// 응답 헤더/바디 복원
@@ -730,7 +810,28 @@ func main() {
 	})
 
 	// 5. HTTP / HTTPS 서버 시작
-	httpHandler := newHTTPHandler(logger)
+	// 프록시 타임아웃은 HOP_SERVER_PROXY_TIMEOUT_SECONDS(초 단위) 로 설정할 수 있으며,
+	// 기본값은 15초입니다. (ko)
+	// The proxy timeout can be configured via HOP_SERVER_PROXY_TIMEOUT_SECONDS
+	// (in seconds); the default is 15 seconds. (en)
+	proxyTimeout := 15 * time.Second
+	if v := strings.TrimSpace(os.Getenv("HOP_SERVER_PROXY_TIMEOUT_SECONDS")); v != "" {
+		if secs, err := strconv.Atoi(v); err != nil {
+			logger.Warn("invalid HOP_SERVER_PROXY_TIMEOUT_SECONDS format, using default", logging.Fields{
+				"value": v,
+				"error": err,
+			})
+		} else if secs <= 0 {
+			logger.Warn("HOP_SERVER_PROXY_TIMEOUT_SECONDS must be positive, using default", logging.Fields{
+				"value": v,
+			})
+		}
+	}
+	logger.Info("http proxy timeout configured", logging.Fields{
+		"timeout_seconds": int64(proxyTimeout.Seconds()),
+	})
+
+	httpHandler := newHTTPHandler(logger, proxyTimeout)
 
 	// Prometheus /metrics 엔드포인트 및 메인 핸들러를 위한 mux 구성
 	httpMux := http.NewServeMux()

@@ -14,6 +14,11 @@ import (
 // TLS/DTLS 핸드셰이크 실패를 나타내는 HTTP 스타일 상태 코드입니다. (예: 525)
 const StatusTLSHandshakeFailed = 525
 
+// StatusGatewayTimeout is an HTTP-style status code representing
+// a gateway timeout between HopGate and the backend (similar to 504).
+// HopGate 와 백엔드 간 요청이 너무 오래 걸려 타임아웃된 경우를 나타내는 상태 코드입니다. (예: 504)
+const StatusGatewayTimeout = http.StatusGatewayTimeout
+
 //go:embed templates/*.html
 var embeddedTemplatesFS embed.FS
 

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -61,7 +62,14 @@ func (p *ClientProxy) StartLoop(ctx context.Context, sess dtls.Session) error {
 	}
 	log := p.Logger
 
-	dec := json.NewDecoder(sess)
+	// NOTE: pion/dtls 는 복호화된 애플리케이션 데이터를 호출자가 제공한 버퍼에 채워 넣습니다.
+	// 기본 JSON 디코더 버퍼(수백 바이트 수준)만 사용하면 큰 HTTP 바디/Envelope 에서
+	// "dtls: buffer too small" 오류가 날 수 있으므로, 여기서는 여유 있는 버퍼(64KiB)를 사용합니다. (ko)
+	// NOTE: pion/dtls decrypts application data into the buffer provided by the caller.
+	// Using only the default JSON decoder buffer (a few hundred bytes) can trigger
+	// "dtls: buffer too small" for large HTTP bodies/envelopes, so we wrap the
+	// session with a reasonably large bufio.Reader (64KiB). (en)
+	dec := json.NewDecoder(bufio.NewReaderSize(sess, 64*1024))
 	enc := json.NewEncoder(sess)
 
 	for {
