@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/dalbodeule/hop-gate/internal/logging"
 )
@@ -141,13 +142,13 @@ type domainExistsResponse struct {
 }
 
 type domainStatusResponse struct {
-	Success   bool   `json:"success"`
-	Exists    bool   `json:"exists"`
-	Domain    string `json:"domain,omitempty"`
-	Memo      string `json:"memo,omitempty"`
-	CreatedAt any    `json:"created_at,omitempty"`
-	UpdatedAt any    `json:"updated_at,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Success   bool      `json:"success"`
+	Exists    bool      `json:"exists"`
+	Domain    string    `json:"domain,omitempty"`
+	Memo      string    `json:"memo,omitempty"`
+	CreatedAt time.Time `json:"created_at,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	Error     string    `json:"error,omitempty"`
 }
 
 func (h *Handler) handleDomainUnregister(w http.ResponseWriter, r *http.Request) {
