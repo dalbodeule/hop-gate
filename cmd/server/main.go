@@ -18,6 +18,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/dalbodeule/hop-gate/internal/acme"
+	"github.com/dalbodeule/hop-gate/internal/admin"
 	"github.com/dalbodeule/hop-gate/internal/config"
 	"github.com/dalbodeule/hop-gate/internal/dtls"
 	"github.com/dalbodeule/hop-gate/internal/logging"
@@ -444,6 +445,18 @@ func main() {
 		"component": "store",
 	})
 
+	// 3.1 Admin Plane: DomainService + Admin HTTP handler 구성
+	adminService := admin.NewDomainService(logger, dbClient)
+
+	// Admin API 키는 환경변수에서 읽어옵니다.
+	// - HOP_ADMIN_API_KEY 가 비어 있으면, 모든 Admin API 요청이 거부됩니다.
+	adminAPIKey := strings.TrimSpace(os.Getenv("HOP_ADMIN_API_KEY"))
+	if adminAPIKey == "" {
+		logger.Warn("HOP_ADMIN_API_KEY is not set; admin API will reject all requests", logging.Fields{
+			"component": "admin_api",
+		})
+	}
+
 	// 3. TLS 설정: ACME(lego)로 인증서를 관리하고, Debug 모드에서는 DTLS에는 self-signed 를 사용하되
 	// ACME 는 항상 시도하되 Staging 모드로 동작하도록 합니다.
 	// 3. TLS setup: manage certificates via ACME (lego); in debug mode DTLS uses self-signed
@@ -582,8 +595,16 @@ func main() {
 	allowedDomain := strings.ToLower(strings.TrimSpace(cfg.Domain))
 
 	// /metrics 는 HOP_SERVER_DOMAIN 에 지정된 도메인으로만 접근 가능하도록 제한합니다.
-	// Admin Plane HTTP mux 도 이후 hostDomainHandler 를 통해 동일하게 제한해야 합니다.
 	httpMux.Handle("/metrics", hostDomainHandler(allowedDomain, logger, promhttp.Handler()))
+
+	// Admin Plane HTTP mux: /api/v1/admin/* 경로를 처리합니다.
+	// - Authorization: Bearer {HOP_ADMIN_API_KEY} 헤더를 사용해 인증합니다.
+	adminHandler := admin.NewHandler(logger, adminAPIKey, adminService)
+	adminMux := http.NewServeMux()
+	adminHandler.RegisterRoutes(adminMux)
+	httpMux.Handle("/api/v1/admin/", hostDomainHandler(allowedDomain, logger, adminMux))
+
+	// 기본 HTTP → DTLS Proxy 엔트리 포인트
 	httpMux.Handle("/", httpHandler)
 
 	// HTTP: 평문 포트

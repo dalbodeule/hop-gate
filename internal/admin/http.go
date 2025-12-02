@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/dalbodeule/hop-gate/internal/logging"
 )
@@ -27,9 +28,13 @@ func NewHandler(logger logging.Logger, adminAPIKey string, svc DomainService) *H
 // RegisterRoutes 는 전달받은 mux 에 관리 API 라우트를 등록합니다.
 //   - POST /api/v1/admin/domains/register
 //   - POST /api/v1/admin/domains/unregister
+//   - GET  /api/v1/admin/domains/exists
+//   - GET  /api/v1/admin/domains/status
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("/api/v1/admin/domains/register", h.authMiddleware(http.HandlerFunc(h.handleDomainRegister)))
 	mux.Handle("/api/v1/admin/domains/unregister", h.authMiddleware(http.HandlerFunc(h.handleDomainUnregister)))
+	mux.Handle("/api/v1/admin/domains/exists", h.authMiddleware(http.HandlerFunc(h.handleDomainExists)))
+	mux.Handle("/api/v1/admin/domains/status", h.authMiddleware(http.HandlerFunc(h.handleDomainStatus)))
 }
 
 // authMiddleware 는 Authorization: Bearer {ADMIN_API_KEY} 헤더를 검증합니다.
@@ -130,6 +135,22 @@ type domainUnregisterResponse struct {
 	Error   string `json:"error,omitempty"`
 }
 
+type domainExistsResponse struct {
+	Success bool   `json:"success"`
+	Exists  bool   `json:"exists"`
+	Error   string `json:"error,omitempty"`
+}
+
+type domainStatusResponse struct {
+	Success   bool      `json:"success"`
+	Exists    bool      `json:"exists"`
+	Domain    string    `json:"domain,omitempty"`
+	Memo      string    `json:"memo,omitempty"`
+	CreatedAt time.Time `json:"created_at,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	Error     string    `json:"error,omitempty"`
+}
+
 func (h *Handler) handleDomainUnregister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		h.writeMethodNotAllowed(w, r)
@@ -171,6 +192,86 @@ func (h *Handler) handleDomainUnregister(w http.ResponseWriter, r *http.Request)
 
 	h.writeJSON(w, http.StatusOK, domainUnregisterResponse{
 		Success: true,
+	})
+}
+
+func (h *Handler) handleDomainExists(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		h.writeMethodNotAllowed(w, r)
+		return
+	}
+
+	domain := strings.TrimSpace(r.URL.Query().Get("domain"))
+	if domain == "" {
+		h.writeJSON(w, http.StatusBadRequest, domainExistsResponse{
+			Success: false,
+			Error:   "domain is required",
+		})
+		return
+	}
+
+	exists, err := h.Service.IsDomainRegistered(r.Context(), domain)
+	if err != nil {
+		h.Logger.Error("failed to check domain existence", logging.Fields{
+			"domain": domain,
+			"error":  err.Error(),
+		})
+		h.writeJSON(w, http.StatusInternalServerError, domainExistsResponse{
+			Success: false,
+			Error:   "internal error",
+		})
+		return
+	}
+
+	h.writeJSON(w, http.StatusOK, domainExistsResponse{
+		Success: true,
+		Exists:  exists,
+	})
+}
+
+func (h *Handler) handleDomainStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		h.writeMethodNotAllowed(w, r)
+		return
+	}
+
+	domain := strings.TrimSpace(r.URL.Query().Get("domain"))
+	if domain == "" {
+		h.writeJSON(w, http.StatusBadRequest, domainStatusResponse{
+			Success: false,
+			Error:   "domain is required",
+		})
+		return
+	}
+
+	row, err := h.Service.GetDomain(r.Context(), domain)
+	if err != nil {
+		if err == ErrDomainNotFound {
+			h.writeJSON(w, http.StatusOK, domainStatusResponse{
+				Success: true,
+				Exists:  false,
+			})
+			return
+		}
+
+		h.Logger.Error("failed to get domain status", logging.Fields{
+			"domain": domain,
+			"error":  err.Error(),
+		})
+		h.writeJSON(w, http.StatusInternalServerError, domainStatusResponse{
+			Success: false,
+			Error:   "internal error",
+		})
+		return
+	}
+
+	h.writeJSON(w, http.StatusOK, domainStatusResponse{
+		Success:   true,
+		Exists:    true,
+		Domain:    row.Domain,
+		Memo:      row.Memo,
+		CreatedAt: row.CreatedAt,
+		UpdatedAt: row.UpdatedAt,
 	})
 }
 
