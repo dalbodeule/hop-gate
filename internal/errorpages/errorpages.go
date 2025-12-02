@@ -22,7 +22,8 @@ var embeddedTemplatesFS embed.FS
 //
 // Expected files (by convention):
 //   - assets/errors.css
-//   - assets/logo.svg
+//   - assets/hop-gate.png
+//
 //go:embed assets/*
 var AssetsFS embed.FS
 
@@ -67,16 +68,14 @@ func Load(status int) ([]byte, bool) {
 	if dir == "" {
 		dir = "./errors"
 	}
-	if dir != "" {
-		p := filepath.Join(dir, name)
-		if data, err := os.ReadFile(p); err == nil {
-			return data, true
-		}
+	p := filepath.Join(dir, name)
+	if data, err := os.ReadFile(p); err == nil {
+		return data, true
 	}
 
 	// 2. Embedded default templates.
 	// 2. 내장 기본 템플릿.
-	p := filepath.Join("templates", name)
+	p = filepath.Join("templates", name)
 	if data, err := embeddedTemplatesFS.ReadFile(p); err == nil {
 		return data, true
 	}
