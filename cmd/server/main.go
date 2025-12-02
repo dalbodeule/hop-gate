@@ -721,16 +721,15 @@ func main() {
 		}
 	}()
 
-	// 6. 도메인 검증기 준비 (현재는 Dummy 구현, 추후 ent + PostgreSQL 기반으로 교체 예정)
-	baseValidator := dtls.DummyDomainValidator{
-		Logger: logger,
-	}
+	// 6. 도메인 검증기 준비 (ent + PostgreSQL 기반 실제 구현)
+	// Admin Plane 에서 관리하는 Domain 테이블을 사용해 (domain, client_api_key) 조합을 검증합니다.
+	domainValidator := admin.NewEntDomainValidator(logger, dbClient)
 
 	// DTLS 핸드셰이크 단계에서 HOP_SERVER_DOMAIN 으로 설정된 도메인만 허용하도록 래핑합니다.
 	allowedDomain = strings.ToLower(strings.TrimSpace(cfg.Domain))
 	var validator dtls.DomainValidator = &domainGateValidator{
 		allowed: allowedDomain,
-		inner:   baseValidator,
+		inner:   domainValidator,
 		logger:  logger,
 	}
 
