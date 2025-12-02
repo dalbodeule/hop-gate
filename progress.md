@@ -157,15 +157,15 @@ This document tracks implementation progress against the HopGate architecture an
 
 ### 3.1 Admin Plane Implementation / 관리 Plane 구현
 
-- [ ] DomainService 실제 구현 추가: [`internal/admin/service.go`](internal/admin/service.go)  
+- [x] DomainService 실제 구현 추가: [`internal/admin/service.go`](internal/admin/service.go)
   - ent.Client + PostgreSQL 기반 `RegisterDomain` / `UnregisterDomain` 구현.  
   - domain + client_api_key 유효성 검증 로직 포함.  
 
-- [ ] Admin API와 서버 라우터 연결: [`cmd/server/main.go`](cmd/server/main.go)  
+- [x] Admin API와 서버 라우터 연결: [`cmd/server/main.go`](cmd/server/main.go)
   - `http.ServeMux` 혹은 router에 `admin.Handler.RegisterRoutes` 연결.  
   - Admin API용 HTTP/HTTPS 엔드포인트 구성.  
 
-- [ ] Admin API 키 관리  
+- [x] Admin API 키 관리
   - env 혹은 설정에 `ADMIN_API_KEY` 추가 및 로딩.  
   - Admin Handler에 주입.  
 
