@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
+	"net"
 	"os"
 	"strings"
 
@@ -118,7 +119,13 @@ func main() {
 	}
 	// DTLS 서버 측은 SNI(ServerName)가 HOP_SERVER_DOMAIN(cfg.Domain)과 일치하는지 검사하므로,
 	// 클라이언트 TLS 설정에도 반드시 도메인을 설정해준다.
-	tlsCfg.ServerName = finalCfg.Domain
+	//
+	// finalCfg.ServerAddr 가 "host:port" 형태이므로, SNI 에는 DNS(host) 부분만 넣어야 한다.
+	host := finalCfg.ServerAddr
+	if h, _, err := net.SplitHostPort(finalCfg.ServerAddr); err == nil && strings.TrimSpace(h) != "" {
+		host = h
+	}
+	tlsCfg.ServerName = host
 
 	client := dtls.NewPionClient(dtls.PionClientConfig{
 		Addr:      finalCfg.ServerAddr,
