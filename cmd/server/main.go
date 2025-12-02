@@ -286,10 +286,10 @@ func newHTTPHandler(logger logging.Logger) http.Handler {
 		//       The /__hopgate_assets__/ path must always serve static assets independently
 		//       of DTLS/backend state. This handler is intended for the generic proxy path (/),
 		//       but as a safety net, we short-circuit asset requests here as well. (en)
-		if strings.HasPrefix(r.URL.Path, "/__hopgate_assets/") {
+		if strings.HasPrefix(r.URL.Path, "/__hopgate_assets__/") {
 			if sub, err := stdfs.Sub(errorpages.AssetsFS, "assets"); err == nil {
 				staticFS := http.FileServer(http.FS(sub))
-				http.StripPrefix("/__hopgate_assets/", staticFS).ServeHTTP(w, r)
+				http.StripPrefix("/__hopgate_assets__/", staticFS).ServeHTTP(w, r)
 				return
 			}
 			// embed FS 가 초기화되지 않은 비정상 상황에서는 500 에러 페이지로 폴백합니다. (ko)
