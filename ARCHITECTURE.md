@@ -101,17 +101,22 @@ This document describes the overall architecture of the HopGate system. (en)
 
 ### 2.5 `internal/protocol`
 
-- 서버와 클라이언트가 DTLS 위에서 주고받는 HTTP 요청/응답 메시지 포맷을 정의합니다. (ko)  
+- 서버와 클라이언트가 DTLS 위에서 주고받는 HTTP 요청/응답 메시지 포맷을 정의합니다. (ko)
 - Defines HTTP request/response message formats exchanged over DTLS between server and clients. (en)
 
-- 요청 메시지 / Request message: (ko/en)  
+- 요청 메시지 / Request message: (ko/en)
   - `RequestID`, `ClientID`, `ServiceName`, `Method`, `URL`, `Header`, `Body`. (ko/en)
 
-- 응답 메시지 / Response message: (ko/en)  
+- 응답 메시지 / Response message: (ko/en)
   - `RequestID`, `Status`, `Header`, `Body`, `Error`. (ko/en)
 
-- 인코딩은 초기에는 JSON을 사용하고, 필요 시 MsgPack/Protobuf 등으로 확장 가능합니다. (ko)  
-- Encoding starts with JSON and may be extended to MsgPack/Protobuf later. (en)
+- 인코딩은 현재 JSON 을 사용하며, 각 HTTP 요청/응답을 하나의 Envelope 로 감싸 DTLS 위에서 전송합니다. (ko)
+- Encoding currently uses JSON, wrapping each HTTP request/response in a single Envelope sent over DTLS. (en)
+
+- 향후에는 `Envelope.StreamOpen` / `StreamData` / `StreamClose` 필드를 활용한 **스트림/프레임 기반 프로토콜**로 전환하여,
+  대용량 HTTP 바디도 DTLS/UDP MTU 한계를 넘지 않도록 chunk 단위로 안전하게 전송할 계획입니다. (ko)
+- In the future, the plan is to move to a **stream/frame-based protocol** using `Envelope.StreamOpen` / `StreamData` / `StreamClose`,
+  so that large HTTP bodies can be safely chunked under DTLS/UDP MTU limits. (en)
 
 ---
 
@@ -217,11 +222,13 @@ The server decodes the `protocol.Response`, converts it back into an HTTP respon
 - `internal/acme` 에 ACME 클라이언트(certmagic 또는 lego 등)를 연결해 TLS 인증서 발급/갱신을 구현합니다. (ko)  
 - Wire an ACME client (certmagic, lego, etc.) into `internal/acme` to implement TLS certificate issuance/renewal. (en)
 
-- `internal/dtls` 에서 pion/dtls 기반 DTLS 전송 계층 및 핸드셰이크를 안정화합니다. (ko)  
+- `internal/dtls` 에서 pion/dtls 기반 DTLS 전송 계층 및 핸드셰이크를 안정화합니다. (ko)
 - Stabilize the pion/dtls-based DTLS transport and handshake logic in `internal/dtls`. (en)
 
-- `internal/protocol` 과 `internal/proxy` 를 통해 실제 HTTP 터널링을 구현하고, 라우팅 규칙을 구성합니다. (ko)  
-- Implement real HTTP tunneling and routing rules via `internal/protocol` and `internal/proxy`. (en)
+- `internal/protocol` 과 `internal/proxy` 를 통해 실제 HTTP 터널링을 구현하고,
+  단일 JSON Envelope 기반 모델에서 `StreamOpen` / `StreamData` / `StreamClose` 중심의 스트림 기반 DTLS 터널링으로 전환합니다. (ko)
+- Implement real HTTP tunneling and routing rules via `internal/protocol` and `internal/proxy`,
+  and move from a single JSON-Envelope model to a stream-based DTLS tunneling model built around `StreamOpen` / `StreamData` / `StreamClose`. (en)
 
 - `internal/admin` + `ent` + PostgreSQL 을 사용해 Domain 등록/해제 및 클라이언트 API Key 발급을 완성합니다. (ko)  
 - Complete domain registration/unregistration and client API key issuing using `internal/admin` + `ent` + PostgreSQL. (en)

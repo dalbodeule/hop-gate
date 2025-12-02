@@ -240,6 +240,45 @@ This document tracks implementation progress against the HopGate architecture an
 - [x] 클라이언트 main 에 Proxy loop wiring 추가: [`cmd/client/main.go`](cmd/client/main.go)
   - handshake 성공 후 `proxy.ClientProxy.StartLoop` 실행.
 
+#### 3.3A Stream-based DTLS Tunneling / 스트림 기반 DTLS 터널링
+
+현재 HTTP 터널링은 **단일 JSON Envelope + 단일 DTLS 쓰기** 방식(요청/응답 바디 전체를 한 번에 전송)이므로,
+대용량 응답 바디에서 UDP MTU 한계로 인한 `sendto: message too long` 문제가 발생할 수 있습니다.
+프로덕션 전 단계에서 이 한계를 제거하기 위해, DTLS 위 애플리케이션 프로토콜을 **완전히 스트림/프레임 기반**으로 재설계합니다.
+
+- [ ] 스트림 프로토콜 설계 및 단일 Envelope 방식 치환: [`internal/protocol/protocol.go`](internal/protocol/protocol.go:50)
+  - `Envelope` 타입의 `StreamOpen` / `StreamData` / `StreamClose` 필드를 사용해 HTTP 요청/응답을 스트림으로 모델링:
+    - 서버 → 클라이언트:
+      - `StreamOpen`: HTTP 요청 라인/헤더 전달.
+      - `StreamData`: 요청 바디를 여러 chunk 로 분할 전송.
+      - `StreamClose`: 요청 바디 종료/스트림 종료 알림.
+    - 클라이언트 → 서버:
+      - `StreamOpen`: HTTP 응답 상태/헤더 전달.
+      - `StreamData`: 응답 바디를 여러 chunk 로 분할 전송.
+      - `StreamClose`: 응답 바디 종료/스트림 종료 알림.
+  - 각 `StreamData.Data` 는 DTLS/UDP MTU 를 고려한 안전한 크기(예: 4–8KiB)로 제한하여,
+    단일 datagram 이 MTU 를 넘지 않도록 함.
+  - 기존 `MessageTypeHTTP` 기반 단일 요청/응답 방식은 스트림 경로가 완성되면 제거하거나 내부용/테스트용으로만 유지.
+
+- [ ] 클라이언트 Proxy 스트림 모드 구현: [`internal/proxy/client.go`](internal/proxy/client.go:55)
+  - Stream ID ↔ 로컬 HTTP 요청/응답을 연결하기 위한 `io.Pipe` 또는 버퍼링 구조 도입.
+  - 서버에서 수신한 `StreamOpen/StreamData/StreamClose` 프레임을 사용해:
+    - 로컬 HTTP 요청을 streaming body 로 구성.
+  - 로컬 HTTP 응답은 반대 방향 스트림으로 전송:
+    - 상태/헤더 → `StreamOpen`.
+    - 바디 chunk → 연속 `StreamData`.
+    - 응답 종료 → `StreamClose`.
+
+- [ ] 서버 측 스트림 처리기 도입: [`cmd/server/main.go`](cmd/server/main.go:160)
+  - 스트림 모드에서는 `ForwardHTTP` 가 전체 `*protocol.Response` 를 반환하는 대신,
+    특정 Stream ID 에 대한 응답을 `http.ResponseWriter` 에 직접 chunk 단위로 중계하는 스트리밍 경로를 구현.
+  - 필요 시 스트림 전용 터널 타입(예: `dtlsStreamTunnel`)을 도입하여,
+    터널링 레이어와 HTTP 레이어를 명확히 분리.
+
+- [ ] JSON 인코딩 유지 여부 검토
+  - 초기에는 JSON 기반 스트림 프레임으로 구현하되,
+    이후 성능/오버헤드 측정을 바탕으로 length-prefix 이진 프레임(MsgPack/Protobuf 등)으로 전환 여부를 재평가한다.
+
 ---
 
 ### 3.4 ACME Integration / ACME 연동

@@ -192,10 +192,45 @@ func (p *ClientProxy) forwardToLocal(ctx context.Context, preq *protocol.Request
 	for k, vs := range res.Header {
 		presp.Header[k] = append([]string(nil), vs...)
 	}
-	body, err := io.ReadAll(res.Body)
+
+	// DTLS over UDP has an upper bound on packet size (~64KiB). 전체 HTTP 바디를
+	// 하나의 JSON Envelope 로 감싸 전송하는 현재 설계에서는 바디가 너무 크면
+	// OS 레벨에서 "message too long" (EMSGSIZE) 가 발생할 수 있습니다. (ko)
+	//
+	// 이를 피하기 위해, 터널링 가능한 바디 크기에 상한을 두고, 이를 초과하는
+	// 응답은 502 Bad Gateway + HopGate 전용 에러 메시지로 대체합니다. (ko)
+	//
+	// DTLS over UDP has an upper bound on datagram size (~64KiB). With the current
+	// design (wrapping the entire HTTP body into a single JSON envelope), very
+	// large bodies can trigger "message too long" (EMSGSIZE) at the OS level.
+	// To avoid this, we cap the tunneled body size and replace oversized responses
+	// with a 502 Bad Gateway + HopGate-specific error body. (en)
+	const maxTunnelBodyBytes = 48 * 1024 // 48KiB, conservative under UDP limits
+
+	limited := &io.LimitedReader{
+		R: res.Body,
+		N: maxTunnelBodyBytes + 1, // read up to limit+1 to detect overflow
+	}
+	body, err := io.ReadAll(limited)
 	if err != nil {
 		return fmt.Errorf("read http response body: %w", err)
 	}
+	if len(body) > maxTunnelBodyBytes {
+		// 응답 바디가 너무 커서 DTLS/UDP 로 안전하게 전송하기 어렵기 때문에,
+		// 원본 바디 대신 HopGate 에러 응답으로 대체합니다. (ko)
+		//
+		// The response body is too large to be safely tunneled over DTLS/UDP.
+		// Replace it with a HopGate error response instead of attempting to
+		// send an oversized datagram. (en)
+		presp.Status = http.StatusBadGateway
+		presp.Header = map[string][]string{
+			"Content-Type": {"text/plain; charset=utf-8"},
+		}
+		presp.Body = []byte("HopGate: response body too large for DTLS tunnel (over max_tunnel_body_bytes)")
+		presp.Error = "response body too large for DTLS tunnel"
+		return nil
+	}
+
 	presp.Body = body
 
 	return nil
