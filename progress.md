@@ -92,11 +92,17 @@ This document tracks implementation progress against the HopGate architecture an
   - `DomainValidator` 인터페이스.  
   - `PerformServerHandshake` / `PerformClientHandshake` 구현 완료.  
 
-- self-signed TLS: [`internal/dtls/selfsigned.go`](internal/dtls/selfsigned.go)  
-  - localhost CN, SAN(DNS/IP) 포함 self-signed cert 생성.  
+- self-signed TLS: [`internal/dtls/selfsigned.go`](internal/dtls/selfsigned.go)
+  - localhost CN, SAN(DNS/IP) 포함 self-signed cert 생성.
 
-- Dummy Validator: [`internal/dtls/validator_dummy.go`](internal/dtls/validator_dummy.go)  
-  - 현재 모든 도메인/API Key 조합을 허용하며, 마스킹된 키와 함께 디버그 로그 출력.  
+- Domain Validator:
+  - 인터페이스 정의: [`internal/dtls/handshake.go`](internal/dtls/handshake.go)
+    - `ValidateDomainAPIKey(ctx, domain, clientAPIKey string) error`.
+  - 실제 구현: [`internal/admin/domain_validator.go`](internal/admin/domain_validator.go)
+    - ent.Client + PostgreSQL 기반으로 `Domain` 테이블 조회.
+    - 도메인 문자열은 `"host"` 또는 `"host:port"` 모두 허용하되, DB 조회 시에는 host 부분만 사용.
+    - `(domain, client_api_key)` 조합이 정확히 일치하는지 검증.
+  - 기존 Dummy 구현: [`internal/dtls/validator_dummy.go`](internal/dtls/validator_dummy.go) 는 이제 개발/테스트용 참고 구현으로만 유지.
 
 ---
 
@@ -202,13 +208,14 @@ This document tracks implementation progress against the HopGate architecture an
 
 ### 3.2 DomainValidator Implementation / DomainValidator 구현
 
-- [ ] `DomainValidator` 의 실제 구현 추가 (예: `internal/admin/domain_validator.go`).  
-  - ent.Client 를 사용해 `Domain` 테이블 조회.  
-  - `(domain, client_api_key)` 조합 검증.  
-  - DummyDomainValidator 를 실제 구현으로 교체.  
+- [x] `DomainValidator` 의 실제 구현 추가 (예: `internal/admin/domain_validator.go`).
+  - ent.Client 를 사용해 `Domain` 테이블 조회.
+  - `(domain, client_api_key)` 조합 검증.
+  - DummyDomainValidator 를 실제 구현으로 교체.
 
-- [ ] DTLS Handshake 와 Admin Plane 통합  
-  - Domain 등록/해제가 handshake 검증 로직에 반영되도록 설계.  
+- [x] DTLS Handshake 와 Admin Plane 통합
+  - Admin Plane 에서 관리하는 Domain 테이블을 사용해, 핸드셰이크 시 `(domain, client_api_key)` 조합을 DB 기준으로 검증.
+  - 도메인 문자열은 `"host"` 또는 `"host:port"` 형태 모두 허용하되, DB 조회용 canonical 도메인에서는 host 부분만 사용.
 
 ---
 
@@ -284,10 +291,10 @@ This document tracks implementation progress against the HopGate architecture an
 
 ### Milestone 1 — DTLS Handshake + Admin + DB (기본 인증 토대)
 
-- [x] DTLS transport & handshake skeleton 구현 (server/client).  
-- [x] Domain ent schema + PostgreSQL 연결 & schema init.  
-- [ ] DomainService 실제 구현 + DomainValidator 구현.  
-- [ ] Admin API + ent + PostgreSQL 연결 (실제 도메인 등록/해제 동작).  
+- [x] DTLS transport & handshake skeleton 구현 (server/client).
+- [x] Domain ent schema + PostgreSQL 연결 & schema init.
+- [x] DomainService 실제 구현 + DomainValidator 구현.
+- [x] Admin API + ent + PostgreSQL 연결 (실제 도메인 등록/해제 동작).
 
 ### Milestone 2 — Full HTTP Tunneling (프락시 동작 완성)
 
