@@ -21,6 +21,9 @@ ARG TARGETARCH=amd64
 
 WORKDIR /src
 
+# Node.js + npm 설치 (Tailwind CSS 빌드를 위해 필요)
+RUN apk add --no-cache nodejs npm
+
 # 모듈/의존성 캐시를 최대한 활용하기 위해 go.mod, go.sum 먼저 복사
 COPY go.mod ./
 COPY go.sum ./
@@ -28,8 +31,13 @@ COPY go.sum ./
 # 의존성 다운로드 (캐시 활용을 위해 소스 전체 복사 전에 실행)
 RUN go mod download
 
-# 실제 소스 코드 복사
+# 실제 소스 코드 및 Tailwind 설정 복사
 COPY . .
+
+# Tailwind 기반 에러 페이지 CSS 빌드
+# - package.json 의 "build:errors-css" 스크립트를 사용해
+#   internal/errorpages/assets/errors.css 를 생성합니다.
+RUN npm install && npm run build:errors-css
 
 # 서버 바이너리 빌드 (멀티 아키텍처: TARGETOS/TARGETARCH 기반)
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/hop-gate-server ./cmd/server

@@ -1,0 +1,32 @@
+ㄱ<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>525 TLS Handshake Failed - HopGate</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="/__hopgate_assets__/errors.css">
+</head>
+<body class="min-h-screen bg-slate-950 text-slate-50 flex items-center justify-center px-4">
+  <div class="w-full max-w-xl text-center">
+    <div class="inline-flex items-center gap-3 mb-8">
+      <img src="/__hopgate_assets__/hop-gate.png" alt="HopGate" class="h-8 w-auto opacity-90" />
+      <span class="text-sm font-medium tracking-[0.25em] uppercase text-slate-400">HopGate</span>
+    </div>
+
+    <div class="inline-flex items-baseline gap-4 mb-4">
+      <span class="text-6xl md:text-7xl font-extrabold tracking-[0.25em] text-amber-300">525</span>
+      <span class="text-lg md:text-xl font-semibold text-slate-100">TLS/DTLS Handshake Failed</span>
+    </div>
+
+    <p class="text-sm md:text-base text-slate-300 leading-relaxed">
+      The secure tunnel to the backend could not be established.<br>
+      백엔드와의 TLS/DTLS 핸드셰이크에 실패하여 요청을 처리할 수 없습니다.
+    </p>
+
+    <div class="mt-8 text-xs md:text-sm text-slate-500">
+      This is usually a temporary issue between the edge and the origin service.<br>
+      보통 엣지와 백엔드 서비스 간의 일시적인 문제일 수 있습니다.
+    </div>
+  </div>
+</body>
+</html>

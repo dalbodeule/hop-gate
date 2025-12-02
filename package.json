@@ -1,0 +1,25 @@
+{
+  "name": "hop-gate",
+  "private": true,
+  "version": "1.0.0",
+  "description": "> Korean / English bilingual README. (ko/en 병기 README입니다.)",
+  "homepage": "https://github.com/dalbodeule/hop-gate#readme",
+  "bugs": {
+    "url": "https://github.com/dalbodeule/hop-gate/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dalbodeule/hop-gate.git"
+  },
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "build:errors-css": "tailwindcss -c ./tools/tailwind/tailwind.config.cjs -i ./tools/tailwind/input.css -o ./internal/errorpages/assets/errors.css --minify"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.1.17",
+    "tailwindcss": "^4.1.17"
+  }
+}

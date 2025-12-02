@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	stdfs "io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"github.com/dalbodeule/hop-gate/internal/admin"
 	"github.com/dalbodeule/hop-gate/internal/config"
 	"github.com/dalbodeule/hop-gate/internal/dtls"
+	"github.com/dalbodeule/hop-gate/internal/errorpages"
 	"github.com/dalbodeule/hop-gate/internal/logging"
 	"github.com/dalbodeule/hop-gate/internal/observability"
 	"github.com/dalbodeule/hop-gate/internal/protocol"
@@ -169,6 +171,28 @@ var hopGateOwnedHeaders = map[string]struct{}{
 	"Referrer-Policy":           {},
 }
 
+// writeErrorPage 는 주요 HTTP 에러 코드(400/404/500/525)에 대해 정적 HTML 에러 페이지를 렌더링합니다. (ko)
+// writeErrorPage renders static HTML error pages for key HTTP error codes (400/404/500/525). (en)
+//
+// 템플릿 로딩 우선순위: (ko)
+//   1) HOP_ERROR_PAGES_DIR/<status>.html (또는 ./errors/<status>.html) (ko)
+//   2) go:embed 로 내장된 templates/<status>.html (ko)
+//
+// Template loading priority: (en)
+//   1) HOP_ERROR_PAGES_DIR/<status>.html (or ./errors/<status>.html) (en)
+//   2) go:embed'ed templates/<status>.html (en)
+func writeErrorPage(w http.ResponseWriter, r *http.Request, status int) {
+	// 공통 보안/식별 헤더를 best-effort 로 설정합니다. (ko)
+	// Configure common security and identity headers (best-effort). (en)
+	if r != nil {
+		setSecurityAndIdentityHeaders(w, r)
+	}
+
+	// Delegates actual HTML rendering to internal/errorpages. (en)
+	// 실제 HTML 렌더링은 internal/errorpages 패키지에 위임합니다. (ko)
+	errorpages.Render(w, r, status)
+}
+
 // setSecurityAndIdentityHeaders 는 HopGate 에서 공통으로 추가하는 보안/식별 헤더를 설정합니다. (ko)
 // setSecurityAndIdentityHeaders configures common security and identity headers for HopGate. (en)
 func setSecurityAndIdentityHeaders(w http.ResponseWriter, r *http.Request) {
@@ -208,8 +232,9 @@ func hostDomainHandler(allowedDomain string, logger logging.Logger, next http.Ha
 					"request_host":   host,
 					"path":           r.URL.Path,
 				})
-				// 메트릭/관리용 엔드포인트에 대해 호스트가 다르면 404 로 응답하여 노출을 최소화합니다.
-				http.NotFound(w, r)
+				// 메트릭/관리용 엔드포인트에 대해 호스트가 다르면 404 페이지로 응답하여 노출을 최소화합니다. (ko)
+				// For metrics/admin endpoints, respond with a 404 page when host mismatches to reduce exposure. (en)
+				writeErrorPage(w, r, http.StatusNotFound)
 				return
 			}
 		}
@@ -287,7 +312,7 @@ func newHTTPHandler(logger logging.Logger) http.Handler {
 			token := strings.Trim(r.URL.Path, "/")
 			if token == "" {
 				observability.ProxyErrorsTotal.WithLabelValues("acme_http01_error").Inc()
-				http.Error(sr, "invalid acme challenge path", http.StatusBadRequest)
+				writeErrorPage(sr, r, http.StatusBadRequest)
 				return
 			}
 			filePath := filepath.Join(webroot, token)
@@ -307,7 +332,7 @@ func newHTTPHandler(logger logging.Logger) http.Handler {
 					"error": err.Error(),
 				})
 				observability.ProxyErrorsTotal.WithLabelValues("acme_http01_error").Inc()
-				http.NotFound(sr, r)
+				writeErrorPage(sr, r, http.StatusNotFound)
 				return
 			}
 			defer f.Close()
@@ -333,7 +358,7 @@ func newHTTPHandler(logger logging.Logger) http.Handler {
 				"host": r.Host,
 			})
 			observability.ProxyErrorsTotal.WithLabelValues("no_dtls_session").Inc()
-			http.Error(sr, "no backend client available", http.StatusBadGateway)
+			writeErrorPage(sr, r, errorpages.StatusTLSHandshakeFailed)
 			return
 		}
 
@@ -370,7 +395,7 @@ func newHTTPHandler(logger logging.Logger) http.Handler {
 				"error": err.Error(),
 			})
 			observability.ProxyErrorsTotal.WithLabelValues("dtls_forward_failed").Inc()
-			http.Error(sr, "dtls forward failed", http.StatusBadGateway)
+			writeErrorPage(sr, r, errorpages.StatusTLSHandshakeFailed)
 			return
 		}
 
@@ -593,6 +618,42 @@ func main() {
 	// Prometheus /metrics 엔드포인트 및 메인 핸들러를 위한 mux 구성
 	httpMux := http.NewServeMux()
 	allowedDomain := strings.ToLower(strings.TrimSpace(cfg.Domain))
+
+	// __hopgate_assets__ prefix:
+	// HopGate 서버가 직접 Tailwind CSS, 로고 등 정적 에셋을 서빙하기 위한 경로입니다. (ko)
+	// This prefix is used for static assets (Tailwind CSS, logos, etc.) served directly by HopGate. (en)
+	//
+	// 우선순위: (ko)
+	//   1) HOP_ERROR_ASSETS_DIR 가 설정되어 있으면 해당 디렉터리 (디스크 기반)
+	//   2) 없으면 internal/errorpages/assets 에 내장된 go:embed 에셋 사용
+	//
+	// Priority: (en)
+	//   1) HOP_ERROR_ASSETS_DIR if set (disk-based)
+	//   2) Otherwise, use go:embed'ed assets under internal/errorpages/assets
+	assetDir := strings.TrimSpace(os.Getenv("HOP_ERROR_ASSETS_DIR"))
+	if assetDir != "" {
+		fs := http.FileServer(http.Dir(assetDir))
+		httpMux.Handle("/__hopgate_assets/",
+			hostDomainHandler(allowedDomain, logger,
+				http.StripPrefix("/__hopgate_assets/", fs),
+			),
+		)
+	} else {
+		// Embedded assets under internal/errorpages/assets.
+		if sub, err := stdfs.Sub(errorpages.AssetsFS, "assets"); err == nil {
+			staticFS := http.FileServer(http.FS(sub))
+			httpMux.Handle("/__hopgate_assets/",
+				hostDomainHandler(allowedDomain, logger,
+					http.StripPrefix("/__hopgate_assets/", staticFS),
+				),
+			)
+		} else {
+			logger.Warn("failed to init embedded assets filesystem", logging.Fields{
+				"component": "error_assets",
+				"error":     err.Error(),
+			})
+		}
+	}
 
 	// /metrics 는 HOP_SERVER_DOMAIN 에 지정된 도메인으로만 접근 가능하도록 제한합니다.
 	httpMux.Handle("/metrics", hostDomainHandler(allowedDomain, logger, promhttp.Handler()))

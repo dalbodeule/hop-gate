@@ -20,11 +20,25 @@ CLIENT_BIN := $(BIN_DIR)/hop-gate-client
 
 VERSION ?= $(shell git describe --tags --dirty --always 2>/dev/null || echo dev)
 
-.PHONY: all server client clean docker-server run-server run-client
+.PHONY: all server client clean docker-server run-server run-client errors-css
 
 all: server client
 
-server:
+# Build Tailwind-based error page CSS (internal/errorpages/assets/errors.css).
+# Tailwind 기반 에러 페이지 CSS 빌드 (internal/errorpages/assets/errors.css).
+errors-css:
+	@if [ -f package.json ]; then \
+		if [ ! -d node_modules ]; then \
+			echo "Installing npm dependencies..."; \
+			npm install; \
+		fi; \
+		echo "Building Tailwind CSS for error pages..."; \
+		npm run build:errors-css; \
+	else \
+		echo "package.json not found; skipping errors-css build"; \
+	fi
+
+server: errors-css
 	@echo "Building server..."
 	@mkdir -p $(BIN_DIR)
 	$(GO) build -ldflags "-X main.version=$(VERSION)" -o $(SERVER_BIN) $(SERVER_PKG)

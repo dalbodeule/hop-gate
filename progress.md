@@ -140,16 +140,45 @@ This document tracks implementation progress against the HopGate architecture an
 
 ### 2.7 Logging / Build / Docker
 
-- 구조적 로깅: [`internal/logging/logging.go`](internal/logging/logging.go)  
-  - JSON 단일라인 로그, `level`, `ts`, `msg`, `Fields`.  
-  - Loki/Promtail + Grafana 스택에 최적화.  
+- 구조적 로깅: [`internal/logging/logging.go`](internal/logging/logging.go)
+  - JSON 단일라인 로그, `level`, `ts`, `msg`, `Fields`.
+  - Loki/Promtail + Grafana 스택에 최적화.
 
 - 빌드/도커:
-  - [`Makefile`](Makefile) — `make server`, `make client`, `make docker-server`.  
-  - [`Dockerfile.server`](Dockerfile.server) — multi-stage build, Alpine runtime.  
-  - [`.dockerignore`](.dockerignore) — `images/` 제외.  
+  - [`Makefile`](Makefile) — `make server`, `make client`, `make docker-server`.
+    - `server` 타겟은 Tailwind 기반 에러 페이지 CSS 빌드를 위한 `errors-css` 타겟을 선행 실행 (`npm run build:errors-css`).
+  - [`Dockerfile.server`](Dockerfile.server) — multi-stage build, Alpine runtime.
+    - Build stage 에 Node.js + npm 을 설치하고, `npm install && npm run build:errors-css` 를 통해 에러 페이지용 CSS를 빌드한 뒤 Go 서버 바이너리를 생성.
+  - [`.dockerignore`](.dockerignore) — `images/` 제외.
 
-- 아키텍처 이미지: [`images/architecture.jpeg`](images/architecture.jpeg)  
+- 아키텍처 이미지: [`images/architecture.jpeg`](images/architecture.jpeg)
+
+---
+
+### 2.8 Error Pages / 에러 페이지
+
+- 에러 페이지 템플릿: [`internal/errorpages/templates/*.html`](internal/errorpages/templates/400.html)
+  - HTTP 상태 코드별 HTML:
+    - `400.html`, `404.html`, `500.html`, `525.html`.
+  - TailwindCSS 기반 레이아웃 및 스타일 적용 (영문/한글 메시지 병기).
+  - `go:embed` 로 서버 바이너리에 포함되어 기본값으로 사용.
+
+- 에러 페이지 정적 에셋: [`internal/errorpages/assets`](internal/errorpages/errorpages.go)
+  - TailwindCSS 빌드 결과: `errors.css` (내장 CSS).
+  - 로고 등 브랜드 리소스: `logo.svg` 등 (내장 가능).
+  - 런타임에서는 `/__hopgate_assets__/...` prefix 로 HopGate 서버가 직접 서빙:
+    - 1순위: `HOP_ERROR_ASSETS_DIR` 가 설정된 경우 해당 디렉터리에서 정적 파일 로드.
+    - 2순위: 설정되지 않은 경우 `internal/errorpages/assets` 에 embed 된 에셋 사용.
+
+- 에러 페이지 렌더링 로직: [`internal/errorpages/errorpages.go`](internal/errorpages/errorpages.go), [`cmd/server/main.go`](cmd/server/main.go)
+  - `writeErrorPage(w, r, status)` → `errorpages.Render` 호출.
+  - HTML 로딩 우선순위:
+    - 1) `HOP_ERROR_PAGES_DIR/<status>.html` (env 미설정 시 `./errors/<status>.html`)
+    - 2) `internal/errorpages/templates/<status>.html` (go:embed 기본 템플릿)
+  - 주요 사용처:
+    - 잘못된 ACME HTTP-01 요청 (400/404).
+    - 허용되지 않은 Host 요청 (404).
+    - DTLS 세션 부재/포워딩 실패 → 525 TLS/DTLS Handshake Failed 페이지.
 
 ---
 
