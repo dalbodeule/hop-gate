@@ -175,12 +175,12 @@ var hopGateOwnedHeaders = map[string]struct{}{
 // writeErrorPage renders static HTML error pages for key HTTP error codes (400/404/500/525). (en)
 //
 // 템플릿 로딩 우선순위: (ko)
-//   1) HOP_ERROR_PAGES_DIR/<status>.html (또는 ./errors/<status>.html) (ko)
-//   2) go:embed 로 내장된 templates/<status>.html (ko)
+//  1. HOP_ERROR_PAGES_DIR/<status>.html (또는 ./errors/<status>.html) (ko)
+//  2. go:embed 로 내장된 templates/<status>.html (ko)
 //
 // Template loading priority: (en)
-//   1) HOP_ERROR_PAGES_DIR/<status>.html (or ./errors/<status>.html) (en)
-//   2) go:embed'ed templates/<status>.html (en)
+//  1. HOP_ERROR_PAGES_DIR/<status>.html (or ./errors/<status>.html) (en)
+//  2. go:embed'ed templates/<status>.html (en)
 func writeErrorPage(w http.ResponseWriter, r *http.Request, status int) {
 	// 공통 보안/식별 헤더를 best-effort 로 설정합니다. (ko)
 	// Configure common security and identity headers (best-effort). (en)
@@ -278,6 +278,26 @@ func newHTTPHandler(logger logging.Logger) http.Handler {
 	webroot := strings.TrimSpace(os.Getenv("HOP_ACME_WEBROOT"))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// NOTE: /__hopgate_assets__/ 경로는 DTLS/백엔드와 무관하게 항상 정적 에셋만 서빙해야 합니다. (ko)
+		//       이 핸들러(newHTTPHandler)는 일반 프록시 경로(/)에만 사용되어야 하지만,
+		//       혹시라도 라우팅/구성이 꼬여서 이쪽으로 들어오는 경우를 방지하기 위해
+		//       /__hopgate_assets__/ 요청은 여기서도 강제로 정적 핸들러로 처리합니다. (ko)
+		//
+		//       The /__hopgate_assets__/ path must always serve static assets independently
+		//       of DTLS/backend state. This handler is intended for the generic proxy path (/),
+		//       but as a safety net, we short-circuit asset requests here as well. (en)
+		if strings.HasPrefix(r.URL.Path, "/__hopgate_assets/") {
+			if sub, err := stdfs.Sub(errorpages.AssetsFS, "assets"); err == nil {
+				staticFS := http.FileServer(http.FS(sub))
+				http.StripPrefix("/__hopgate_assets/", staticFS).ServeHTTP(w, r)
+				return
+			}
+			// embed FS 가 초기화되지 않은 비정상 상황에서는 500 에러 페이지로 폴백합니다. (ko)
+			// If embedded FS is not available for some reason, fall back to a 500 error page. (en)
+			writeErrorPage(w, r, http.StatusInternalServerError)
+			return
+		}
+
 		start := time.Now()
 		method := r.Method
 
