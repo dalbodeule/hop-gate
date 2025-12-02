@@ -504,7 +504,7 @@ func newHTTPHandler(logger logging.Logger, proxyTimeout time.Duration) http.Hand
 			return
 		}
 
-		sessWrapper := getSessionForHost(r.Host)
+		sessWrapper := getSessionForHost(hostLower)
 		if sessWrapper == nil {
 			log.Warn("no dtls session for host", logging.Fields{
 				"host": r.Host,
@@ -562,8 +562,14 @@ func newHTTPHandler(logger logging.Logger, proxyTimeout time.Duration) http.Hand
 		resultCh := make(chan forwardResult, 1)
 
 		go func() {
-			resp, err := sessWrapper.ForwardHTTP(ctx, logger, r, serviceName)
-			resultCh <- forwardResult{resp: resp, err: err}
+			select {
+			case <-ctx.Done():
+				// Context cancelled, do not proceed.
+				return
+			default:
+				resp, err := sessWrapper.ForwardHTTP(ctx, logger, r, serviceName)
+				resultCh <- forwardResult{resp: resp, err: err}
+			}
 		}()
 
 		var protoResp *protocol.Response
@@ -810,13 +816,15 @@ func main() {
 	// (in seconds); the default is 15 seconds. (en)
 	proxyTimeout := 15 * time.Second
 	if v := strings.TrimSpace(os.Getenv("HOP_SERVER_PROXY_TIMEOUT_SECONDS")); v != "" {
-		if secs, err := strconv.Atoi(v); err != nil || secs <= 0 {
-			logger.Warn("invalid HOP_SERVER_PROXY_TIMEOUT_SECONDS, using default", logging.Fields{
+		if secs, err := strconv.Atoi(v); err != nil {
+			logger.Warn("invalid HOP_SERVER_PROXY_TIMEOUT_SECONDS format, using default", logging.Fields{
 				"value": v,
 				"error": err,
 			})
-		} else {
-			proxyTimeout = time.Duration(secs) * time.Second
+		} else if secs <= 0 {
+			logger.Warn("HOP_SERVER_PROXY_TIMEOUT_SECONDS must be positive, using default", logging.Fields{
+				"value": v,
+			})
 		}
 	}
 	logger.Info("http proxy timeout configured", logging.Fields{
