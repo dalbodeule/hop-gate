@@ -78,19 +78,19 @@ This document tracks implementation progress against the HopGate architecture an
 
 ### 2.4 DTLS Layer / Handshake
 
-- 인터페이스: [`internal/dtls/dtls.go`](internal/dtls/dtls.go)  
-  - `Session`, `Server`, `Client`.  
+- 인터페이스: [`internal/dtls/dtls.go`](internal/dtls/dtls.go)
+  - `Session`, `Server`, `Client`.
 
-- pion/dtls 전송 구현: [`internal/dtls/transport_pion.go`](internal/dtls/transport_pion.go)  
-  - `NewPionServer(PionServerConfig)`  
-    - UDP 리스너 + DTLS 서버 (`piondtls.Listen`).  
-  - `NewPionClient(PionClientConfig)`  
-    - Timeout/TLSConfig 설정, `piondtls.Dial` 사용.  
+- pion/dtls 전송 구현: [`internal/dtls/transport_pion.go`](internal/dtls/transport_pion.go)
+  - `NewPionServer(PionServerConfig)`
+    - UDP 리스너 + DTLS 서버 (`piondtls.Listen`).
+  - `NewPionClient(PionClientConfig)`
+    - Timeout/TLSConfig 설정, `piondtls.Dial` 사용.
 
-- 핸드셰이크 로직: [`internal/dtls/handshake.go`](internal/dtls/handshake.go)  
-  - 메시지: `handshakeRequest{domain, client_api_key}`, `handshakeResponse{ok, message, domain}`.  
-  - `DomainValidator` 인터페이스.  
-  - `PerformServerHandshake` / `PerformClientHandshake` 구현 완료.  
+- 핸드셰이크 로직: [`internal/dtls/handshake.go`](internal/dtls/handshake.go)
+  - 메시지: `handshakeRequest{domain, client_api_key}`, `handshakeResponse{ok, message, domain}`.
+  - `DomainValidator` 인터페이스.
+  - `PerformServerHandshake` / `PerformClientHandshake` 구현 완료.
 
 - self-signed TLS: [`internal/dtls/selfsigned.go`](internal/dtls/selfsigned.go)
   - localhost CN, SAN(DNS/IP) 포함 self-signed cert 생성.
@@ -102,6 +102,9 @@ This document tracks implementation progress against the HopGate architecture an
     - ent.Client + PostgreSQL 기반으로 `Domain` 테이블 조회.
     - 도메인 문자열은 `"host"` 또는 `"host:port"` 모두 허용하되, DB 조회 시에는 host 부분만 사용.
     - `(domain, client_api_key)` 조합이 정확히 일치하는지 검증.
+  - DTLS 핸드셰이크 DNS/IP 게이트: [`cmd/server/main.go`](cmd/server/main.go:37)
+    - `canonicalizeDomainForDNS` + `domainGateValidator` 를 사용해, 클라이언트가 제시한 도메인의 A/AAAA 레코드가 `HOP_ACME_EXPECT_IPS` 에 설정된 IPv4/IPv6 IP 중 하나 이상과 일치하는지 검사한 뒤 DB 기반 `DomainValidator` 에 위임.
+    - `HOP_ACME_EXPECT_IPS` 가 비어 있는 경우에는 DNS/IP 검증을 생략하고 DB 검증만 수행.
   - 기존 Dummy 구현: [`internal/dtls/validator_dummy.go`](internal/dtls/validator_dummy.go) 는 이제 개발/테스트용 참고 구현으로만 유지.
 
 ---

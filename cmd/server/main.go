@@ -34,29 +34,126 @@ type dtlsSessionWrapper struct {
 	mu   sync.Mutex
 }
 
-// domainGateValidator 는 DTLS 핸드셰이크에서 허용된 도메인(HOP_SERVER_DOMAIN)만 통과시키기 위한 래퍼입니다. (ko)
-// domainGateValidator wraps another DomainValidator and allows only the configured HOP_SERVER_DOMAIN. (en)
+// canonicalizeDomainForDNS 는 DTLS 핸드셰이크에서 전달된 도메인 문자열을
+// DNS 조회 및 DB 조회에 사용할 수 있는 정규화된 호스트명으로 변환합니다. (ko)
+// canonicalizeDomainForDNS normalizes the domain string from the DTLS handshake
+// into a host name suitable for DNS and DB lookups. (en)
+func canonicalizeDomainForDNS(raw string) string {
+	d := strings.TrimSpace(raw)
+	if d == "" {
+		return ""
+	}
+	// "host:port" 형태가 들어온 경우 포트를 제거합니다. (ko)
+	// Strip port if the value is in "host:port" form. (en)
+	if h, _, err := net.SplitHostPort(d); err == nil && strings.TrimSpace(h) != "" {
+		d = h
+	}
+	return strings.ToLower(d)
+}
+
+// domainGateValidator 는 DTLS 핸드셰이크 시 도메인이 EXPECT_IPS(HOP_ACME_EXPECT_IPS)에
+// 설정된 IP(IPv4/IPv6)로 해석되는지 검사한 뒤, 내부 DomainValidator 로 위임합니다. (ko)
+// domainGateValidator first checks that the domain resolves to one of the
+// expected IPs (from HOP_ACME_EXPECT_IPS), then delegates to the inner
+// DomainValidator for (domain, client_api_key) validation. (en)
 type domainGateValidator struct {
-	allowed string
-	inner   dtls.DomainValidator
-	logger  logging.Logger
+	expectedIPs []net.IP
+	inner       dtls.DomainValidator
+	logger      logging.Logger
 }
 
 func (v *domainGateValidator) ValidateDomainAPIKey(ctx context.Context, domain, clientAPIKey string) error {
-	d := strings.ToLower(strings.TrimSpace(domain))
-	if v.allowed != "" && d != v.allowed {
-		if v.logger != nil {
-			v.logger.Warn("dtls handshake rejected due to mismatched domain", logging.Fields{
-				"expected_domain": v.allowed,
-				"received_domain": d,
-			})
-		}
-		return fmt.Errorf("domain %s is not allowed for dtls handshake", domain)
+	d := canonicalizeDomainForDNS(domain)
+	if d == "" {
+		return fmt.Errorf("empty domain is not allowed for dtls handshake")
 	}
+
+	// EXPECT_IPS(HOP_ACME_EXPECT_IPS)가 설정된 경우, 도메인이 해당 IP(IPv4/IPv6)들로
+	// 해석되는지 DNS(A/AAAA) 조회를 통해 검증합니다. (ko)
+	// If EXPECT_IPS (HOP_ACME_EXPECT_IPS) is configured, ensure that the domain
+	// resolves (via A/AAAA) to at least one of the expected IPs. (en)
+	if len(v.expectedIPs) > 0 {
+		resolver := net.DefaultResolver
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		ips, err := resolver.LookupIP(ctx, "ip", d)
+		if err != nil {
+			if v.logger != nil {
+				v.logger.Warn("dtls handshake dns resolution failed", logging.Fields{
+					"domain": d,
+					"error":  err.Error(),
+				})
+			}
+			return fmt.Errorf("dns resolution failed for %s: %w", d, err)
+		}
+
+		match := false
+		for _, ip := range ips {
+			for _, expected := range v.expectedIPs {
+				if ip.Equal(expected) {
+					match = true
+					break
+				}
+			}
+			if match {
+				break
+			}
+		}
+
+		if !match {
+			if v.logger != nil {
+				v.logger.Warn("dtls handshake rejected due to unexpected resolved IPs", logging.Fields{
+					"domain":       d,
+					"resolved_ips": ips,
+					"expected_ips": v.expectedIPs,
+				})
+			}
+			return fmt.Errorf("domain %s does not resolve to any expected IPs", d)
+		}
+	}
+
 	if v.inner != nil {
-		return v.inner.ValidateDomainAPIKey(ctx, domain, clientAPIKey)
+		return v.inner.ValidateDomainAPIKey(ctx, d, clientAPIKey)
 	}
 	return nil
+}
+
+// parseExpectedIPsFromEnv 는 HOP_ACME_EXPECT_IPS 와 같이 콤마로 구분된 IP 목록
+// 환경변수를 파싱해 net.IP 슬라이스로 변환합니다. IPv4/IPv6 모두 지원합니다. (ko)
+// parseExpectedIPsFromEnv parses a comma-separated list of IPs from env (e.g. HOP_ACME_EXPECT_IPS)
+// into a slice of net.IP, supporting both IPv4 and IPv6 literals. (en)
+func parseExpectedIPsFromEnv(logger logging.Logger, envKey string) []net.IP {
+	raw := strings.TrimSpace(os.Getenv(envKey))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	var result []net.IP
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		ip := net.ParseIP(p)
+		if ip == nil {
+			if logger != nil {
+				logger.Warn("invalid ip in env, skipping", logging.Fields{
+					"env":   envKey,
+					"value": p,
+				})
+			}
+			continue
+		}
+		result = append(result, ip)
+	}
+	if logger != nil {
+		logger.Info("loaded expected handshake ips from env", logging.Fields{
+			"env": envKey,
+			"ips": result,
+		})
+	}
+	return result
 }
 
 // ForwardHTTP 는 단일 HTTP 요청을 DTLS 세션으로 포워딩하고 응답을 돌려받습니다.
@@ -725,12 +822,17 @@ func main() {
 	// Admin Plane 에서 관리하는 Domain 테이블을 사용해 (domain, client_api_key) 조합을 검증합니다.
 	domainValidator := admin.NewEntDomainValidator(logger, dbClient)
 
-	// DTLS 핸드셰이크 단계에서 HOP_SERVER_DOMAIN 으로 설정된 도메인만 허용하도록 래핑합니다.
-	allowedDomain = strings.ToLower(strings.TrimSpace(cfg.Domain))
+	// DTLS 핸드셰이크 단계에서는 클라이언트가 제시한 도메인의 DNS(A/AAAA)가
+	// HOP_ACME_EXPECT_IPS 에 설정된 IP들 중 하나 이상을 가리키는지 추가로 검증합니다. (ko)
+	// During DTLS handshake, additionally verify that the presented domain resolves
+	// (via A/AAAA) to at least one IP configured in HOP_ACME_EXPECT_IPS. (en)
+	// EXPECT_IPS 가 비어 있으면 DNS 기반 검증은 생략하고 DB 검증만 수행합니다. (ko)
+	// If EXPECT_IPS is empty, only DB-based validation is performed. (en)
+	expectedHandshakeIPs := parseExpectedIPsFromEnv(logger, "HOP_ACME_EXPECT_IPS")
 	var validator dtls.DomainValidator = &domainGateValidator{
-		allowed: allowedDomain,
-		inner:   domainValidator,
-		logger:  logger,
+		expectedIPs: expectedHandshakeIPs,
+		inner:       domainValidator,
+		logger:      logger,
 	}
 
 	// 7. DTLS Accept 루프 + Handshake
