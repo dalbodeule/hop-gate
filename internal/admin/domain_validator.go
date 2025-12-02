@@ -43,12 +43,12 @@ func canonicalDomainForLookup(raw string) string {
 	if h, _, err := net.SplitHostPort(d); err == nil && strings.TrimSpace(h) != "" {
 		d = h
 	} else {
-		// net.SplitHostPort 가 실패했지만 콜론이 포함되어 있는 경우 (예: 잘못된 포맷),
-		// IPv6 를 고려하지 않는 단순 환경에서는 마지막 콜론 기준으로 host 부분만 시도해볼 수 있습니다.
-		if idx := strings.LastIndex(d, ":"); idx > 0 && !strings.Contains(d, "]") {
-			if h := strings.TrimSpace(d[:idx]); h != "" {
-				d = h
-			}
+		// [nitpick] If the input is a bracketed IPv6 address without a port (e.g., "[::1]"),
+		// net.SplitHostPort fails, and the fallback above won't execute due to the ']' check.
+		// For robustness, strip brackets if present. Note: normalizeDomain requires a dot,
+		// so IP addresses (including IPv6) will be rejected downstream.
+		if strings.HasPrefix(d, "[") && strings.HasSuffix(d, "]") {
+			d = d[1 : len(d)-1]
 		}
 	}
 

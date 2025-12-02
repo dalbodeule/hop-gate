@@ -294,7 +294,7 @@ This document tracks implementation progress against the HopGate architecture an
 - [x] DTLS transport & handshake skeleton 구현 (server/client).
 - [x] Domain ent schema + PostgreSQL 연결 & schema init.
 - [x] DomainService 실제 구현 + DomainValidator 구현.
-- [ ] Admin API + ent + PostgreSQL 연결 (실제 도메인 등록/해제 동작).
+- [x] Admin API + ent + PostgreSQL 연결 (실제 도메인 등록/해제 동작).
 
 ### Milestone 2 — Full HTTP Tunneling (프락시 동작 완성)
 
