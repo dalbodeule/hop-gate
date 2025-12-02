@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>400 Bad Request - HopGate</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+    <!-- Tailwind CSS is served separately from /__hopgate_assets__/errors.css -->
+  <link rel="stylesheet" href="/__hopgate_assets__/errors.css">
+</head>
+<body class="min-h-screen bg-slate-950 text-slate-50 flex items-center justify-center px-4">
+  <div class="w-full max-w-xl text-center">
+    <div class="inline-flex items-center gap-3 mb-8">
+      <img src="/__hopgate_assets__/hop-gate.png" alt="HopGate" class="h-8 w-auto opacity-90" />
+      <span class="text-sm font-medium tracking-[0.25em] uppercase text-slate-400">HopGate</span>
+    </div>
+
+    <div class="inline-flex items-baseline gap-4 mb-4">
+      <span class="text-6xl md:text-7xl font-extrabold tracking-[0.25em] text-amber-300">400</span>
+      <span class="text-lg md:text-xl font-semibold text-slate-100">Bad Request</span>
+    </div>
+
+    <p class="text-sm md:text-base text-slate-300 leading-relaxed">
+      The request was malformed or invalid.<br>
+      요청 형식이 올바르지 않거나 지원되지 않습니다.
+    </p>
+
+    <div class="mt-8 text-xs md:text-sm text-slate-500">
+      If you typed the URL directly, please check it for spelling.<br>
+      URL을 직접 입력하셨다면 철자를 다시 한 번 확인해 주세요.
+    </div>
+  </div>
+</body>
+</html>
