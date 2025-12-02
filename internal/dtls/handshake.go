@@ -1,6 +1,7 @@
 package dtls
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -61,7 +62,16 @@ func PerformServerHandshake(
 	}
 
 	var req handshakeRequest
-	if err := json.NewDecoder(sess).Decode(&req); err != nil {
+	// NOTE: pion/dtls 는 application plaintext 를 Caller's buffer 에 복호화하므로,
+	// JSON 디코더가 사용하는 버퍼 크기가 너무 작으면 "dtls: buffer too small" 이 발생할 수 있습니다.
+	// 이를 피하기 위해 충분히 큰 bufio.Reader(예: 64KiB)를 사용합니다. (ko)
+	// pion/dtls decrypts application data into the buffer provided by the caller.
+	// To avoid "dtls: buffer too small" errors when JSON payloads are larger than
+	// the default decoder buffer, we wrap the session in a bufio.Reader with a
+	// sufficiently large size (e.g. 64KiB). (en)
+	dec := json.NewDecoder(bufio.NewReaderSize(sess, 64*1024))
+
+	if err := dec.Decode(&req); err != nil {
 		log.Error("failed to read handshake request", logging.Fields{
 			"error": err.Error(),
 		})
@@ -151,7 +161,11 @@ func PerformClientHandshake(
 	}
 
 	var resp handshakeResponse
-	if err := json.NewDecoder(sess).Decode(&resp); err != nil {
+	// 클라이언트 측에서도 동일하게 큰 버퍼를 사용해 "buffer too small" 오류를 방지합니다. (ko)
+	// Use the same larger buffer on the client side as well. (en)
+	dec := json.NewDecoder(bufio.NewReaderSize(sess, 64*1024))
+
+	if err := dec.Decode(&resp); err != nil {
 		log.Error("failed to read handshake response", logging.Fields{
 			"error": err.Error(),
 		})

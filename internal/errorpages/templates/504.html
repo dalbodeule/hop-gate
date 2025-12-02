@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>504 Gateway Timeout - HopGate</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="/__hopgate_assets__/errors.css">
+</head>
+<body class="min-h-screen bg-slate-950 text-slate-50 flex items-center justify-center px-4">
+  <div class="w-full max-w-xl text-center">
+    <div class="items-center justify-center gap-3 mb-8 flex flex-col">
+      <img src="/__hopgate_assets__/hop-gate.png" alt="HopGate" class="h-8 w-[240px] opacity-90" />
+      <h2 class="text-md font-medium tracking-[0.25em] uppercase text-slate-400">HopGate</h2>
+    </div>
+
+    <div class="inline-flex items-baseline gap-4 mb-4">
+      <span class="text-6xl md:text-7xl font-extrabold tracking-[0.25em] text-amber-200">504</span>
+      <span class="text-lg md:text-xl font-semibold text-slate-100">Gateway Timeout</span>
+    </div>
+
+    <p class="text-sm md:text-base text-slate-300 leading-relaxed">
+      The request to the backend service took too long and was timed out by HopGate.<br>
+      백엔드 서비스로의 요청이 너무 오래 걸려 HopGate 에서 타임아웃 처리되었습니다.
+    </p>
+
+    <div class="mt-8 text-xs md:text-sm text-slate-500">
+      This may happen when the origin is overloaded or responding very slowly.<br>
+      원본 서버가 과부하 상태이거나 응답이 매우 느린 경우에 발생할 수 있습니다.
+    </div>
+  </div>
+</body>
+</html>
