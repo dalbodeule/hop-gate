@@ -245,39 +245,176 @@ This document tracks implementation progress against the HopGate architecture an
 현재 HTTP 터널링은 **단일 JSON Envelope + 단일 DTLS 쓰기** 방식(요청/응답 바디 전체를 한 번에 전송)이므로,
 대용량 응답 바디에서 UDP MTU 한계로 인한 `sendto: message too long` 문제가 발생할 수 있습니다.
 프로덕션 전 단계에서 이 한계를 제거하기 위해, DTLS 위 애플리케이션 프로토콜을 **완전히 스트림/프레임 기반**으로 재설계합니다.
+The current tunneling model uses a **single JSON envelope + single DTLS write per HTTP message**, which can hit UDP MTU limits (`sendto: message too long`) for large bodies.
+Before production, we will redesign the application protocol over DTLS to be fully **stream/frame-based**.
 
-- [ ] 스트림 프로토콜 설계 및 단일 Envelope 방식 치환: [`internal/protocol/protocol.go`](internal/protocol/protocol.go:50)
-  - `Envelope` 타입의 `StreamOpen` / `StreamData` / `StreamClose` 필드를 사용해 HTTP 요청/응답을 스트림으로 모델링:
-    - 서버 → 클라이언트:
-      - `StreamOpen`: HTTP 요청 라인/헤더 전달.
-      - `StreamData`: 요청 바디를 여러 chunk 로 분할 전송.
-      - `StreamClose`: 요청 바디 종료/스트림 종료 알림.
-    - 클라이언트 → 서버:
-      - `StreamOpen`: HTTP 응답 상태/헤더 전달.
-      - `StreamData`: 응답 바디를 여러 chunk 로 분할 전송.
-      - `StreamClose`: 응답 바디 종료/스트림 종료 알림.
-  - 각 `StreamData.Data` 는 DTLS/UDP MTU 를 고려한 안전한 크기(예: 4–8KiB)로 제한하여,
-    단일 datagram 이 MTU 를 넘지 않도록 함.
-  - 기존 `MessageTypeHTTP` 기반 단일 요청/응답 방식은 스트림 경로가 완성되면 제거하거나 내부용/테스트용으로만 유지.
+고려해야 할 제약 / Constraints:
 
-- [ ] 클라이언트 Proxy 스트림 모드 구현: [`internal/proxy/client.go`](internal/proxy/client.go:55)
-  - Stream ID ↔ 로컬 HTTP 요청/응답을 연결하기 위한 `io.Pipe` 또는 버퍼링 구조 도입.
-  - 서버에서 수신한 `StreamOpen/StreamData/StreamClose` 프레임을 사용해:
-    - 로컬 HTTP 요청을 streaming body 로 구성.
-  - 로컬 HTTP 응답은 반대 방향 스트림으로 전송:
-    - 상태/헤더 → `StreamOpen`.
-    - 바디 chunk → 연속 `StreamData`.
-    - 응답 종료 → `StreamClose`.
+- 전송 계층은 DTLS(pion/dtls)를 유지합니다.
+  The transport layer must remain DTLS (pion/dtls).
+- JSON 기반 단일 Envelope 모델에서 벗어나, HTTP 바디를 안전한 크기의 chunk 로 나누어 전송해야 합니다.
+  We must move away from the single-envelope JSON model and chunk HTTP bodies under a safe MTU.
+- UDP 특성상 일부 프레임 손실/오염에 대비해, **해당 chunk 만 재전송 요청할 수 있는 ARQ 메커니즘**이 필요합니다.
+  Given UDP characteristics, we need an application-level ARQ so that **only lost/corrupted chunks are retransmitted**.
 
-- [ ] 서버 측 스트림 처리기 도입: [`cmd/server/main.go`](cmd/server/main.go:160)
-  - 스트림 모드에서는 `ForwardHTTP` 가 전체 `*protocol.Response` 를 반환하는 대신,
-    특정 Stream ID 에 대한 응답을 `http.ResponseWriter` 에 직접 chunk 단위로 중계하는 스트리밍 경로를 구현.
-  - 필요 시 스트림 전용 터널 타입(예: `dtlsStreamTunnel`)을 도입하여,
-    터널링 레이어와 HTTP 레이어를 명확히 분리.
+아래 단계들은 `feature/udp-stream` 브랜치에서 구현할 구체적인 작업 항목입니다.
+The following tasks describe concrete work items to be implemented on the `feature/udp-stream` branch.
 
-- [ ] JSON 인코딩 유지 여부 검토
-  - 초기에는 JSON 기반 스트림 프레임으로 구현하되,
-    이후 성능/오버헤드 측정을 바탕으로 length-prefix 이진 프레임(MsgPack/Protobuf 등)으로 전환 여부를 재평가한다.
+---
+
+##### 3.3A.1 스트림 프레이밍 프로토콜 설계 (JSON 1단계)
+##### 3.3A.1 Stream framing protocol (JSON, phase 1)
+
+- [ ] 스트림 프레임 타입 정리 및 확장: [`internal/protocol/protocol.go`](internal/protocol/protocol.go:35)
+  - 이미 정의된 스트림 관련 타입을 1단계에서 적극 활용합니다.
+    Reuse the already defined stream-related types in phase 1:
+    - `MessageTypeStreamOpen`, `MessageTypeStreamData`, `MessageTypeStreamClose`
+    - [`Envelope`](internal/protocol/protocol.go:52), [`StreamOpen`](internal/protocol/protocol.go:69), [`StreamData`](internal/protocol/protocol.go:80), [`StreamClose`](internal/protocol/protocol.go:86)
+  - `StreamData` 에 per-stream 시퀀스 번호를 추가합니다.
+    Add a per-stream sequence number to `StreamData`:
+    - 예시 / Example:
+      ```go
+      type StreamData struct {
+      	ID   StreamID `json:"id"`
+      	Seq  uint64   `json:"seq"`  // 0부터 시작하는 per-stream sequence
+      	Data []byte   `json:"data"`
+      }
+      ```
+
+- [ ] 스트림 ACK / 재전송 제어 메시지 추가: [`internal/protocol/protocol.go`](internal/protocol/protocol.go:52)
+  - 선택적 재전송(Selective Retransmission)을 위해 `StreamAck` 메시지와 `MessageTypeStreamAck` 를 추가합니다.
+    Add `StreamAck` message and `MessageTypeStreamAck` for selective retransmission:
+    ```go
+    const (
+    	MessageTypeStreamAck MessageType = "stream_ack"
+    )
+
+    type StreamAck struct {
+    	ID         StreamID `json:"id"`              // 대상 스트림 / target stream
+    	AckSeq     uint64   `json:"ack_seq"`        // 연속으로 수신 완료한 마지막 Seq / last contiguous sequence
+    	LostSeqs   []uint64 `json:"lost_seqs"`      // 누락된 시퀀스 목록(선택) / optional list of missing seqs
+    	WindowSize uint32   `json:"window_size"`    // 선택: 허용 in-flight 프레임 수 / optional receive window
+    }
+    ```
+  - [`Envelope`](internal/protocol/protocol.go:52)에 `StreamAck *StreamAck` 필드를 추가합니다.
+    Extend `Envelope` with a `StreamAck *StreamAck` field.
+
+- [ ] MTU-safe chunk 크기 정의
+  - DTLS/UDP 헤더, JSON 인코딩 오버헤드를 고려해 안전한 payload 크기(예: 4KiB)를 상수로 정의합니다.
+    Define a safe payload size constant (e.g. 4KiB) considering DTLS/UDP headers and JSON overhead.
+  - 모든 HTTP 바디는 이 크기 이하의 chunk 로 잘라 `StreamData.Data` 에 담아 전송합니다.
+    All HTTP bodies must be sliced into chunks no larger than this and carried in `StreamData.Data`.
+
+---
+
+##### 3.3A.2 애플리케이션 레벨 ARQ 설계 (Selective Retransmission)
+##### 3.3A.2 Application-level ARQ (Selective Retransmission)
+
+- [ ] 수신 측 스트림 상태 관리 로직 설계
+  - 스트림별로 다음 상태를 유지합니다.
+    For each stream, maintain:
+    - `expectedSeq` (다음에 연속으로 기대하는 Seq, 초기값 0)
+      `expectedSeq` – next contiguous sequence expected (starts at 0)
+    - `received` (map[uint64][]byte) – 도착했지만 아직 순서가 맞지 않은 chunk 버퍼
+      `received` – buffer for out-of-order chunks
+    - `lastAckSent`, `lostBuffer` – 마지막 ACK 상태 및 누락 시퀀스 기록
+      `lastAckSent`, `lostBuffer` – last acknowledged seq and known missing sequences
+  - `StreamData{ID, Seq, Data}` 수신 시:
+    When receiving `StreamData{ID, Seq, Data}`:
+    - `Seq == expectedSeq` 인 경우: 바로 상위(HTTP Body writer)에 전달 후,
+      `expectedSeq++` 하면서 `received` map 에 쌓인 연속된 Seq 들을 순서대로 flush.
+      If `Seq == expectedSeq`, deliver to the HTTP body writer, increment `expectedSeq`, and flush any contiguous buffered seqs.
+    - `Seq > expectedSeq` 인 경우: `received[Seq] = Data` 로 버퍼링하고,
+      `expectedSeq` ~ `Seq-1` 구간 중 비어 있는 Seq 들을 `lostBuffer` 에 추가.
+      If `Seq > expectedSeq`, buffer as out-of-order and mark missing seqs in `lostBuffer`.
+
+- [ ] 수신 측 StreamAck 전송 정책
+  - 주기적 타이머 또는 일정 수의 프레임 처리 후에 `StreamAck` 를 전송합니다.
+    Send `StreamAck` periodically or after processing N frames:
+    - `AckSeq = expectedSeq - 1` (연속 수신 완료 지점)
+      `AckSeq = expectedSeq - 1` – last contiguous sequence received
+    - `LostSeqs` 는 윈도우 내 손실 시퀀스 중 상한 개수까지만 포함 (과도한 길이 방지).
+      `LostSeqs` should only include a bounded set of missing seqs within the receive window.
+
+- [ ] 송신 측 재전송 로직
+  - 스트림별로 다음 상태를 유지합니다.
+    For each stream on the sender:
+    - `sendSeq` – 송신에 사용할 다음 Seq (0부터 시작)
+    - `outstanding` – map[seq]*FrameState (`data`, `lastSentAt`, `retryCount` 포함)
+  - 새 chunk 전송 시:
+    On new chunk:
+    - `seq := sendSeq`, `sendSeq++`, `outstanding[seq] = FrameState{...}`,
+      `StreamData{ID, Seq: seq, Data}` 전송.
+  - `StreamAck{AckSeq, LostSeqs}` 수신 시:
+    On receiving `StreamAck`:
+    - `seq <= AckSeq` 인 `outstanding` 항목은 **모두 삭제** (해당 지점까지 연속 수신으로 간주).
+      Delete all `outstanding` entries with `seq <= AckSeq`.
+    - `LostSeqs` 에 포함된 시퀀스는 즉시 재전송 (`retryCount++`, `lastSentAt = now` 업데이트).
+      Retransmit frames whose seqs are listed in `LostSeqs`.
+  - 타임아웃 기반 재전송:
+    Timeout-based retransmission:
+    - 주기적으로 `outstanding` 을 순회하며 `now - lastSentAt > RTO` 인 프레임을 재전송 (단순 고정 RTO 로 시작).
+      Periodically scan `outstanding` and retransmit frames that exceed a fixed RTO.
+
+---
+
+##### 3.3A.3 HTTP ↔ 스트림 매핑 (서버/클라이언트)
+##### 3.3A.3 HTTP ↔ stream mapping (server/client)
+
+- [ ] 서버 → 클라이언트 요청 스트림: [`cmd/server/main.go`](cmd/server/main.go:200)
+  - 현재 `ForwardHTTP` 는 단일 `HTTPRequest`/`HTTPResponse` 를 처리하는 구조입니다.
+    Currently `ForwardHTTP` handles a single `HTTPRequest`/`HTTPResponse` pair.
+  - 스트림 모드에서는 다음과 같이 바꿉니다.
+    In stream mode:
+    - HTTP 요청 수신 시:
+      - 새로운 `StreamID` 를 발급합니다 (세션별 증가).
+        Generate a new `StreamID` per incoming HTTP request on the DTLS session.
+      - `StreamOpen` 전송:
+        - 요청 메서드/URL/헤더를 [`StreamOpen`](internal/protocol/protocol.go:69) 의 `Header` 혹은 pseudo-header 로 encode.
+          Encode method/URL/headers into `StreamOpen.Header` or a pseudo-header scheme.
+      - 요청 바디를 읽으면서 `StreamData{ID, Seq, Data}` 를 지속적으로 전송합니다.
+        Read the HTTP request body and send it as a sequence of `StreamData` frames.
+      - 바디 종료 시 `StreamClose{ID, Error:""}` 를 전송합니다.
+        When the body ends, send `StreamClose{ID, Error:""}`.
+    - 응답 수신:
+      - 클라이언트에서 오는 역방향 `StreamOpen` 으로 HTTP status/header 를 수신하고,
+        이를 `http.ResponseWriter` 에 반영합니다.
+        Receive response status/headers via reverse-direction `StreamOpen` and map them to `http.ResponseWriter`.
+      - 연속되는 `StreamData` 를 수신할 때마다 `http.ResponseWriter.Write` 로 chunk 를 바로 전송합니다.
+        For each `StreamData`, write the chunk directly to the HTTP response.
+      - `StreamClose` 수신 시 응답 종료 및 스트림 자원 정리.
+        On `StreamClose`, finish the response and clean up per-stream state.
+
+- [ ] 클라이언트에서의 요청 처리 스트림: [`internal/proxy/client.go`](internal/proxy/client.go:200)
+  - 서버로부터 들어오는 `StreamOpen{ID, ...}` 을 수신하면,
+    새로운 goroutine 을 띄워 해당 ID에 대한 로컬 HTTP 요청을 수행합니다.
+    On receiving `StreamOpen{ID, ...}` from the server, spawn a goroutine to handle the local HTTP request for that stream ID.
+  - 스트림별로 `io.Pipe` 또는 채널 기반 바디 리더를 준비하고,
+    `StreamData` 프레임을 수신할 때마다 이 파이프에 쓰도록 합니다.
+    Prepare an `io.Pipe` (or channel-backed reader) per stream and write incoming `StreamData` chunks into it.
+  - 로컬 HTTP 클라이언트 응답은 반대로:
+    For the local HTTP client response:
+    - 응답 status/header → `StreamOpen` (client → server)
+    - 응답 바디 → 여러 개의 `StreamData`
+    - 종료 시점에 `StreamClose` 전송
+      Send `StreamOpen` (status/headers), then a sequence of `StreamData`, followed by `StreamClose` when done.
+
+---
+
+##### 3.3A.4 JSON → 바이너리 직렬화로의 잠재적 전환 (2단계)
+##### 3.3A.4 JSON → binary serialization (potential phase 2)
+
+- [ ] JSON 기반 스트림 프로토콜의 1단계 구현/안정화 이후, 직렬화 포맷 재검토
+  - 현재는 디버깅/호환성 관점에서 JSON `Envelope` + base64 `[]byte` encoding 이 유리합니다.
+    For now, JSON `Envelope` + base64-encoded `[]byte` is convenient for debugging and compatibility.
+  - HTTP 바디 chunk 가 MTU-safe 크기(예: 4KiB)로 제한되므로, JSON 오버헤드는 수용 가능합니다.
+    Since body chunks are bounded to a safe MTU-sized payload, JSON overhead is acceptable initially.
+- [ ] 필요 시 length-prefix 이진 프레임(Protobuf 등)으로 전환
+  - 동일한 logical model (`StreamOpen` / `StreamData(seq)` / `StreamClose` / `StreamAck`)을 유지한 채,
+    wire-format 만 Protobuf 또는 MsgPack 등의 length-prefix binary 프레이밍으로 교체할 수 있습니다.
+    We can later keep the same logical model and swap the wire format for Protobuf or other length-prefix binary framing.
+  - 이 전환은 `internal/protocol` 내 직렬화 레이어를 얇은 abstraction 으로 감싸 구현할 수 있습니다.
+    This can be implemented by wrapping serialization in a thin abstraction layer inside [`internal/protocol`](internal/protocol/protocol.go:35).
 
 ---
 
