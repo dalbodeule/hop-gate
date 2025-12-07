@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	stdfs "io/fs"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -29,8 +28,6 @@ import (
 	"github.com/dalbodeule/hop-gate/internal/observability"
 	"github.com/dalbodeule/hop-gate/internal/protocol"
 	"github.com/dalbodeule/hop-gate/internal/store"
-
-	"github.com/joho/godotenv"
 )
 
 type dtlsSessionWrapper struct {
@@ -38,17 +35,13 @@ type dtlsSessionWrapper struct {
 	mu   sync.Mutex
 }
 
-func init() {
-	// .env 파일 로드
-	if err := godotenv.Overload(); err != nil {
-		log.Fatalf(".env 파일을 로드할 수 없습니다: %v", err)
-	}
-}
-
-func getEnvOrPanic(key string) string {
+func getEnvOrPanic(logger logging.Logger, key string) string {
 	value, exists := os.LookupEnv(key)
-	if !exists || value == "" {
-		log.Fatalf("필수 환경 변수 %s가 설정되지 않았습니다.", key)
+	if !exists || strings.TrimSpace(value) == "" {
+		logger.Error("missing required environment variable", logging.Fields{
+			"env": key,
+		})
+		os.Exit(1)
 	}
 	return value
 }
@@ -648,34 +641,8 @@ func newHTTPHandler(logger logging.Logger, proxyTimeout time.Duration) http.Hand
 func main() {
 	logger := logging.NewStdJSONLogger("server")
 
-	// .env 파일 로드
-	if err := godotenv.Load(); err != nil {
-		log.Println(".env 파일을 로드할 수 없습니다. 기본 환경 변수를 사용합니다.")
-	}
-
-	// 필수 환경 변수 유효성 검사
-	httpListen := getEnvOrPanic("HOP_SERVER_HTTP_LISTEN")
-	httpsListen := getEnvOrPanic("HOP_SERVER_HTTPS_LISTEN")
-	dtlsListen := getEnvOrPanic("HOP_SERVER_DTLS_LISTEN")
-	domain := getEnvOrPanic("HOP_SERVER_DOMAIN")
-	debug := getEnvOrPanic("HOP_SERVER_DEBUG")
-
-	// 디버깅 플래그 확인
-	if debug != "true" && debug != "false" {
-		log.Fatalf("HOP_SERVER_DEBUG 값이 잘못되었습니다. true 또는 false로 설정해야 합니다.")
-	}
-
-	// 유효성 검사 결과 출력
-	log.Printf("HTTP_LISTEN: %s", httpListen)
-	log.Printf("HTTPS_LISTEN: %s", httpsListen)
-	log.Printf("DTLS_LISTEN: %s", dtlsListen)
-	log.Printf("DOMAIN: %s", domain)
-	log.Printf("DEBUG: %s", debug)
-
-	// Prometheus 메트릭 등록
-	observability.MustRegister()
-
 	// 1. 서버 설정 로드 (.env + 환경변수)
+	// internal/config 패키지가 .env 를 먼저 읽고, 이미 설정된 OS 환경변수를 우선시합니다.
 	cfg, err := config.LoadServerConfigFromEnv()
 	if err != nil {
 		logger.Error("failed to load server config from env", logging.Fields{
@@ -683,6 +650,34 @@ func main() {
 		})
 		os.Exit(1)
 	}
+
+	// 2. 필수 환경 변수 유효성 검사 (.env 포함; OS 환경변수가 우선)
+	httpListenEnv := getEnvOrPanic(logger, "HOP_SERVER_HTTP_LISTEN")
+	httpsListenEnv := getEnvOrPanic(logger, "HOP_SERVER_HTTPS_LISTEN")
+	dtlsListenEnv := getEnvOrPanic(logger, "HOP_SERVER_DTLS_LISTEN")
+	domainEnv := getEnvOrPanic(logger, "HOP_SERVER_DOMAIN")
+	debugEnv := getEnvOrPanic(logger, "HOP_SERVER_DEBUG")
+
+	// 디버깅 플래그 형식 확인
+	if debugEnv != "true" && debugEnv != "false" {
+		logger.Error("invalid value for HOP_SERVER_DEBUG; must be 'true' or 'false'", logging.Fields{
+			"env":   "HOP_SERVER_DEBUG",
+			"value": debugEnv,
+		})
+		os.Exit(1)
+	}
+
+	// 유효성 검사 결과를 구조화 로그로 출력
+	logger.Info("validated server env vars", logging.Fields{
+		"HOP_SERVER_HTTP_LISTEN":  httpListenEnv,
+		"HOP_SERVER_HTTPS_LISTEN": httpsListenEnv,
+		"HOP_SERVER_DTLS_LISTEN":  dtlsListenEnv,
+		"HOP_SERVER_DOMAIN":       domainEnv,
+		"HOP_SERVER_DEBUG":        debugEnv,
+	})
+
+	// Prometheus 메트릭 등록
+	observability.MustRegister()
 
 	logger.Info("hop-gate server starting", logging.Fields{
 		"stack":        "prometheus-loki-grafana",

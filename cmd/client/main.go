@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
-	"log"
 	"net"
 	"os"
 	"strings"
@@ -14,21 +13,15 @@ import (
 	"github.com/dalbodeule/hop-gate/internal/dtls"
 	"github.com/dalbodeule/hop-gate/internal/logging"
 	"github.com/dalbodeule/hop-gate/internal/proxy"
-
-	"github.com/joho/godotenv"
 )
 
-func init() {
-	// .env 파일 로드
-	if err := godotenv.Overload(); err != nil {
-		log.Fatalf(".env 파일을 로드할 수 없습니다: %v", err)
-	}
-}
-
-func getEnvOrPanic(key string) string {
+func getEnvOrPanic(logger logging.Logger, key string) string {
 	value, exists := os.LookupEnv(key)
-	if !exists || value == "" {
-		log.Fatalf("필수 환경 변수 %s가 설정되지 않았습니다.", key)
+	if !exists || strings.TrimSpace(value) == "" {
+		logger.Error("missing required environment variable", logging.Fields{
+			"env": key,
+		})
+		os.Exit(1)
 	}
 	return value
 }
@@ -54,29 +47,40 @@ func firstNonEmpty(values ...string) string {
 func main() {
 	logger := logging.NewStdJSONLogger("client")
 
-	// .env 파일 로드
-	if err := godotenv.Load(); err != nil {
-		log.Println("Failed to load .env file. Using default environment variables.")
+	// 1. 환경변수(.env 포함)에서 클라이언트 설정 로드
+	// internal/config 패키지가 .env 를 먼저 읽고, 이미 설정된 OS 환경변수를 우선시합니다.
+	envCfg, err := config.LoadClientConfigFromEnv()
+	if err != nil {
+		logger.Error("failed to load client config from env", logging.Fields{
+			"error": err.Error(),
+		})
+		os.Exit(1)
 	}
 
-	// 필수 환경 변수 유효성 검사
-	serverAddr := getEnvOrPanic("HOP_CLIENT_SERVER_ADDR")
-	clientDomain := getEnvOrPanic("HOP_CLIENT_DOMAIN")
-	apiKey := getEnvOrPanic("HOP_CLIENT_API_KEY")
-	localTarget := getEnvOrPanic("HOP_CLIENT_LOCAL_TARGET")
-	debug := getEnvOrPanic("HOP_CLIENT_DEBUG")
+	// 2. 필수 환경 변수 유효성 검사 (.env 포함; OS 환경변수가 우선)
+	serverAddrEnv := getEnvOrPanic(logger, "HOP_CLIENT_SERVER_ADDR")
+	clientDomainEnv := getEnvOrPanic(logger, "HOP_CLIENT_DOMAIN")
+	apiKeyEnv := getEnvOrPanic(logger, "HOP_CLIENT_API_KEY")
+	localTargetEnv := getEnvOrPanic(logger, "HOP_CLIENT_LOCAL_TARGET")
+	debugEnv := getEnvOrPanic(logger, "HOP_CLIENT_DEBUG")
 
-	// 디버깅 플래그 확인
-	if debug != "true" && debug != "false" {
-		log.Fatalf("Invalid value for HOP_CLIENT_DEBUG. It must be set to 'true' or 'false'.")
+	// 디버깅 플래그 형식 확인
+	if debugEnv != "true" && debugEnv != "false" {
+		logger.Error("invalid value for HOP_CLIENT_DEBUG; must be 'true' or 'false'", logging.Fields{
+			"env":   "HOP_CLIENT_DEBUG",
+			"value": debugEnv,
+		})
+		os.Exit(1)
 	}
 
-	// 유효성 검사 결과 출력
-	log.Printf("SERVER_ADDR: %s", serverAddr)
-	log.Printf("CLIENT_DOMAIN: %s", clientDomain)
-	log.Printf("API_KEY: %s", maskAPIKey(apiKey))
-	log.Printf("LOCAL_TARGET: %s", localTarget)
-	log.Printf("DEBUG: %s", debug)
+	// 유효성 검사 결과를 구조화 로그로 출력
+	logger.Info("validated client env vars", logging.Fields{
+		"HOP_CLIENT_SERVER_ADDR":  serverAddrEnv,
+		"HOP_CLIENT_DOMAIN":       clientDomainEnv,
+		"HOP_CLIENT_API_KEY_MASK": maskAPIKey(apiKeyEnv),
+		"HOP_CLIENT_LOCAL_TARGET": localTargetEnv,
+		"HOP_CLIENT_DEBUG":        debugEnv,
+	})
 
 	// CLI 인자 정의 (env 보다 우선 적용됨)
 	serverAddrFlag := flag.String("server-addr", "", "DTLS server address (host:port)")
@@ -85,15 +89,6 @@ func main() {
 	localTargetFlag := flag.String("local-target", "", "local HTTP target (host:port), e.g. 127.0.0.1:8080")
 
 	flag.Parse()
-
-	// 1. 환경변수(.env 포함)에서 클라이언트 설정 로드
-	envCfg, err := config.LoadClientConfigFromEnv()
-	if err != nil {
-		logger.Error("failed to load client config from env", logging.Fields{
-			"error": err.Error(),
-		})
-		os.Exit(1)
-	}
 
 	// 2. CLI 인자 우선, env 후순위로 최종 설정 구성
 	finalCfg := &config.ClientConfig{
