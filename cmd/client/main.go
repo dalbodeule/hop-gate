@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
+	"log"
 	"net"
 	"os"
 	"strings"
@@ -13,7 +14,24 @@ import (
 	"github.com/dalbodeule/hop-gate/internal/dtls"
 	"github.com/dalbodeule/hop-gate/internal/logging"
 	"github.com/dalbodeule/hop-gate/internal/proxy"
+
+	"github.com/joho/godotenv"
 )
+
+func init() {
+	// .env 파일 로드
+	if err := godotenv.Overload(); err != nil {
+		log.Fatalf(".env 파일을 로드할 수 없습니다: %v", err)
+	}
+}
+
+func getEnvOrPanic(key string) string {
+	value, exists := os.LookupEnv(key)
+	if !exists || value == "" {
+		log.Fatalf("필수 환경 변수 %s가 설정되지 않았습니다.", key)
+	}
+	return value
+}
 
 // maskAPIKey 는 로그에 노출할 때 클라이언트 API Key 를 일부만 보여주기 위한 헬퍼입니다.
 func maskAPIKey(key string) string {
@@ -35,6 +53,30 @@ func firstNonEmpty(values ...string) string {
 
 func main() {
 	logger := logging.NewStdJSONLogger("client")
+
+	// .env 파일 로드
+	if err := godotenv.Load(); err != nil {
+		log.Println("Failed to load .env file. Using default environment variables.")
+	}
+
+	// 필수 환경 변수 유효성 검사
+	serverAddr := getEnvOrPanic("HOP_CLIENT_SERVER_ADDR")
+	clientDomain := getEnvOrPanic("HOP_CLIENT_DOMAIN")
+	apiKey := getEnvOrPanic("HOP_CLIENT_API_KEY")
+	localTarget := getEnvOrPanic("HOP_CLIENT_LOCAL_TARGET")
+	debug := getEnvOrPanic("HOP_CLIENT_DEBUG")
+
+	// 디버깅 플래그 확인
+	if debug != "true" && debug != "false" {
+		log.Fatalf("Invalid value for HOP_CLIENT_DEBUG. It must be set to 'true' or 'false'.")
+	}
+
+	// 유효성 검사 결과 출력
+	log.Printf("SERVER_ADDR: %s", serverAddr)
+	log.Printf("CLIENT_DOMAIN: %s", clientDomain)
+	log.Printf("API_KEY: %s", maskAPIKey(apiKey))
+	log.Printf("LOCAL_TARGET: %s", localTarget)
+	log.Printf("DEBUG: %s", debug)
 
 	// CLI 인자 정의 (env 보다 우선 적용됨)
 	serverAddrFlag := flag.String("server-addr", "", "DTLS server address (host:port)")

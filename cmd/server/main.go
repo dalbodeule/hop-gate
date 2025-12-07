@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	stdfs "io/fs"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -28,11 +29,28 @@ import (
 	"github.com/dalbodeule/hop-gate/internal/observability"
 	"github.com/dalbodeule/hop-gate/internal/protocol"
 	"github.com/dalbodeule/hop-gate/internal/store"
+
+	"github.com/joho/godotenv"
 )
 
 type dtlsSessionWrapper struct {
 	sess dtls.Session
 	mu   sync.Mutex
+}
+
+func init() {
+	// .env 파일 로드
+	if err := godotenv.Overload(); err != nil {
+		log.Fatalf(".env 파일을 로드할 수 없습니다: %v", err)
+	}
+}
+
+func getEnvOrPanic(key string) string {
+	value, exists := os.LookupEnv(key)
+	if !exists || value == "" {
+		log.Fatalf("필수 환경 변수 %s가 설정되지 않았습니다.", key)
+	}
+	return value
 }
 
 // canonicalizeDomainForDNS 는 DTLS 핸드셰이크에서 전달된 도메인 문자열을
@@ -277,8 +295,8 @@ var hopGateOwnedHeaders = map[string]struct{}{
 	"Referrer-Policy":           {},
 }
 
-// writeErrorPage 는 주요 HTTP 에러 코드(400/404/500/502/504/525)에 대해 정적 HTML 에러 페이지를 렌더링합니다. (ko)
-// writeErrorPage renders static HTML error pages for key HTTP error codes (400/404/500/502/504/525). (en)
+// writeErrorPage 는 주요 HTTP 에러 코드(400/404/500/525)에 대해 정적 HTML 에러 페이지를 렌더링합니다. (ko)
+// writeErrorPage renders static HTML error pages for key HTTP error codes (400/404/500/525). (en)
 //
 // 템플릿 로딩 우선순위: (ko)
 //  1. HOP_ERROR_PAGES_DIR/<status>.html (또는 ./errors/<status>.html) (ko)
@@ -294,31 +312,9 @@ func writeErrorPage(w http.ResponseWriter, r *http.Request, status int) {
 		setSecurityAndIdentityHeaders(w, r)
 	}
 
-	// 4xx / 5xx 대역에 대한 템플릿 매핑 규칙: (ko)
-	// - 400 series: 400.html 로 렌더링 (단, 404 는 404.html 사용) (ko)
-	// - 500 series: 500.html 로 렌더링 (단, 502/504/525 는 개별 템플릿 사용) (ko)
-	//
-	// Mapping rules for 4xx / 5xx ranges: (en)
-	// - 400 series: render using 400.html (except 404 uses 404.html). (en)
-	// - 500 series: render using 500.html (except 502/504/525 which have dedicated templates). (en)
-	mapped := status
-	switch {
-	case status >= 400 && status < 500:
-		if status != http.StatusBadRequest && status != http.StatusNotFound {
-			mapped = http.StatusBadRequest
-		}
-	case status >= 500 && status < 600:
-		if status != http.StatusInternalServerError &&
-			status != http.StatusBadGateway &&
-			status != errorpages.StatusGatewayTimeout &&
-			status != errorpages.StatusTLSHandshakeFailed {
-			mapped = http.StatusInternalServerError
-		}
-	}
-
-	// Delegates actual HTML rendering to internal/errorpages with mapped status. (en)
-	// 실제 HTML 렌더링은 매핑된 상태 코드로 internal/errorpages 패키지에 위임합니다. (ko)
-	errorpages.Render(w, r, mapped)
+	// Delegates actual HTML rendering to internal/errorpages. (en)
+	// 실제 HTML 렌더링은 internal/errorpages 패키지에 위임합니다. (ko)
+	errorpages.Render(w, r, status)
 }
 
 // setSecurityAndIdentityHeaders 는 HopGate 에서 공통으로 추가하는 보안/식별 헤더를 설정합니다. (ko)
@@ -651,6 +647,30 @@ func newHTTPHandler(logger logging.Logger, proxyTimeout time.Duration) http.Hand
 
 func main() {
 	logger := logging.NewStdJSONLogger("server")
+
+	// .env 파일 로드
+	if err := godotenv.Load(); err != nil {
+		log.Println(".env 파일을 로드할 수 없습니다. 기본 환경 변수를 사용합니다.")
+	}
+
+	// 필수 환경 변수 유효성 검사
+	httpListen := getEnvOrPanic("HOP_SERVER_HTTP_LISTEN")
+	httpsListen := getEnvOrPanic("HOP_SERVER_HTTPS_LISTEN")
+	dtlsListen := getEnvOrPanic("HOP_SERVER_DTLS_LISTEN")
+	domain := getEnvOrPanic("HOP_SERVER_DOMAIN")
+	debug := getEnvOrPanic("HOP_SERVER_DEBUG")
+
+	// 디버깅 플래그 확인
+	if debug != "true" && debug != "false" {
+		log.Fatalf("HOP_SERVER_DEBUG 값이 잘못되었습니다. true 또는 false로 설정해야 합니다.")
+	}
+
+	// 유효성 검사 결과 출력
+	log.Printf("HTTP_LISTEN: %s", httpListen)
+	log.Printf("HTTPS_LISTEN: %s", httpsListen)
+	log.Printf("DTLS_LISTEN: %s", dtlsListen)
+	log.Printf("DOMAIN: %s", domain)
+	log.Printf("DEBUG: %s", debug)
 
 	// Prometheus 메트릭 등록
 	observability.MustRegister()
