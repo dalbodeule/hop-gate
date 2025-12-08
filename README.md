@@ -55,7 +55,7 @@ go mod tidy
 
 ### 3.2 Makefile 사용 (Using Makefile)
 
-서버/클라이언트 빌드를 위해 상위 [`Makefile`](Makefile)을 제공합니다.  
+서버/클라이언트 빌드를 위해 상위 [`Makefile`](Makefile)을 제공합니다.
 A top-level [`Makefile`](Makefile) is provided for server/client builds.
 
 ```bash
@@ -69,10 +69,53 @@ make server
 make client
 ```
 
-빌드 결과는 `./bin/hop-gate-server`, `./bin/hop-gate-client` 로 생성됩니다.  
+빌드 결과는 `./bin/hop-gate-server`, `./bin/hop-gate-client` 로 생성됩니다.
 Build artifacts are created as `./bin/hop-gate-server` and `./bin/hop-gate-client`.
 
 ---
+
+### 3.3 환경변수와 .env 처리 (Environment variables and .env handling)
+
+HopGate 는 공통 설정을 [`internal/config/config.go`](internal/config/config.go) 에서 로드하며,
+**운영체제 환경변수(OS env)가 `.env` 파일보다 우선**하도록 설계되어 있습니다.
+HopGate loads shared configuration from [`internal/config/config.go`](internal/config/config.go) and is designed so that **OS-level environment variables take precedence over `.env`**.
+
+- `.env` 로더: [`loadDotEnvOnce`](internal/config/config.go)
+  - 현재 작업 디렉터리의 `.env` 파일을 한 번만 읽습니다.
+  - 이미 OS 환경변수에 설정된 키는 **덮어쓰지 않고 그대로 유지**하고, 비어 있는 키에 대해서만 `.env` 값을 주입합니다.
+  - `.env` 파일이 존재하지 않으면 조용히 무시합니다 (에러가 아닙니다).
+  The loader reads the `.env` file once, **does not override existing OS env values**, and only fills missing keys. If `.env` is missing, it is silently ignored.
+
+- 서버 설정 로더 (Server config loader): [`LoadServerConfigFromEnv`](internal/config/config.go)
+  - `.env` 로더를 먼저 호출한 뒤, `HOP_SERVER_*` 환경변수에서 서버 설정을 구성합니다.
+  - 실제 실행 시점에는 서버 엔트리포인트 [`cmd/server/main.go`](cmd/server/main.go) 에서 필수 환경변수가 모두 설정되었는지 한 번 더 검증합니다.
+  It calls the `.env` loader first, then builds server config from `HOP_SERVER_*` env vars, and finally the server entrypoint [`cmd/server/main.go`](cmd/server/main.go) validates required variables.
+
+- 클라이언트 설정 로더 (Client config loader): [`LoadClientConfigFromEnv`](internal/config/config.go)
+  - `.env` 로더를 동일하게 사용하며, `HOP_CLIENT_*` 환경변수에서 클라이언트 설정을 구성합니다.
+  - 이후 CLI 인자(예: `--server-addr`, `--domain`)가 있을 경우 env 값보다 우선 적용됩니다.
+  The same loader is used for `HOP_CLIENT_*` env vars, and CLI flags override env values when provided.
+
+빌드/실행 시 필수 환경변수는 다음 두 단계에서 검증됩니다.
+Required environment variables are validated in two stages:
+
+1. **빌드 단계 (Build-time) – Makefile 체크 (optional guard)**
+   - [`Makefile`](Makefile) 에서 `.env` 를 `include` 한 뒤, `check-env-server` / `check-env-client` 타깃으로 최소한의 필수 env 를 확인합니다.
+   - 예) 서버 빌드 시: `make server` → `errors-css` → `check-env-server` → `go build` 순으로 실행됩니다.
+   The [`Makefile`](Makefile) includes `.env` and uses `check-env-server` / `check-env-client` targets to guard required variables before build.
+
+2. **실행 단계 (Runtime) – 엔트리포인트에서 엄격 검증 (strict runtime validation)**
+   - 서버: [`cmd/server/main.go`](cmd/server/main.go)
+     - 헬퍼 `getEnvOrPanic(logger, key)` 를 사용해 `HOP_SERVER_HTTP_LISTEN`, `HOP_SERVER_HTTPS_LISTEN`, `HOP_SERVER_DTLS_LISTEN`, `HOP_SERVER_DOMAIN`, `HOP_SERVER_DEBUG` 가 비어 있지 않은지 확인합니다.
+     - 누락되었거나 공백인 경우, 구조화 에러 로그(JSON)와 함께 프로세스를 종료합니다.
+   - 클라이언트: [`cmd/client/main.go`](cmd/client/main.go)
+     - `HOP_CLIENT_SERVER_ADDR`, `HOP_CLIENT_DOMAIN`, `HOP_CLIENT_API_KEY`, `HOP_CLIENT_LOCAL_TARGET`, `HOP_CLIENT_DEBUG` 를 동일한 방식으로 검증합니다.
+   - 두 경우 모두 `HOP_*_DEBUG` 값은 문자열 `"true"` 또는 `"false"` 만 허용합니다.
+   Both server and client use a helper (`getEnvOrPanic`) to enforce non-empty required env vars at startup and log structured JSON errors on failure. The debug flags must be the strings `"true"` or `"false"`.
+
+실제 배포 환경에서는 `.env` 보다는 시스템 환경변수(Kubernetes `env`, Docker `-e`, systemd `Environment=` 등)를 사용하는 것을 권장하며,
+로컬 개발에서는 `.env.example` 을 복사한 `.env` 파일을 사용해 빠르게 설정을 구성할 수 있습니다.
+For production deployments, prefer OS-level env (Kubernetes `env`, Docker `-e`, systemd `Environment=`, etc.), and use a local `.env` (copied from `.env.example`) mainly for development.
 
 ## 4. DTLS 핸드셰이크 테스트 (Testing DTLS Handshake)
 

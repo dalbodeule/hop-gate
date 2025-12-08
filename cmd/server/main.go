@@ -35,6 +35,17 @@ type dtlsSessionWrapper struct {
 	mu   sync.Mutex
 }
 
+func getEnvOrPanic(logger logging.Logger, key string) string {
+	value, exists := os.LookupEnv(key)
+	if !exists || strings.TrimSpace(value) == "" {
+		logger.Error("missing required environment variable", logging.Fields{
+			"env": key,
+		})
+		os.Exit(1)
+	}
+	return value
+}
+
 // canonicalizeDomainForDNS 는 DTLS 핸드셰이크에서 전달된 도메인 문자열을
 // DNS 조회 및 DB 조회에 사용할 수 있는 정규화된 호스트명으로 변환합니다. (ko)
 // canonicalizeDomainForDNS normalizes the domain string from the DTLS handshake
@@ -277,8 +288,8 @@ var hopGateOwnedHeaders = map[string]struct{}{
 	"Referrer-Policy":           {},
 }
 
-// writeErrorPage 는 주요 HTTP 에러 코드(400/404/500/502/504/525)에 대해 정적 HTML 에러 페이지를 렌더링합니다. (ko)
-// writeErrorPage renders static HTML error pages for key HTTP error codes (400/404/500/502/504/525). (en)
+// writeErrorPage 는 주요 HTTP 에러 코드(400/404/500/525)에 대해 정적 HTML 에러 페이지를 렌더링합니다. (ko)
+// writeErrorPage renders static HTML error pages for key HTTP error codes (400/404/500/525). (en)
 //
 // 템플릿 로딩 우선순위: (ko)
 //  1. HOP_ERROR_PAGES_DIR/<status>.html (또는 ./errors/<status>.html) (ko)
@@ -294,31 +305,9 @@ func writeErrorPage(w http.ResponseWriter, r *http.Request, status int) {
 		setSecurityAndIdentityHeaders(w, r)
 	}
 
-	// 4xx / 5xx 대역에 대한 템플릿 매핑 규칙: (ko)
-	// - 400 series: 400.html 로 렌더링 (단, 404 는 404.html 사용) (ko)
-	// - 500 series: 500.html 로 렌더링 (단, 502/504/525 는 개별 템플릿 사용) (ko)
-	//
-	// Mapping rules for 4xx / 5xx ranges: (en)
-	// - 400 series: render using 400.html (except 404 uses 404.html). (en)
-	// - 500 series: render using 500.html (except 502/504/525 which have dedicated templates). (en)
-	mapped := status
-	switch {
-	case status >= 400 && status < 500:
-		if status != http.StatusBadRequest && status != http.StatusNotFound {
-			mapped = http.StatusBadRequest
-		}
-	case status >= 500 && status < 600:
-		if status != http.StatusInternalServerError &&
-			status != http.StatusBadGateway &&
-			status != errorpages.StatusGatewayTimeout &&
-			status != errorpages.StatusTLSHandshakeFailed {
-			mapped = http.StatusInternalServerError
-		}
-	}
-
-	// Delegates actual HTML rendering to internal/errorpages with mapped status. (en)
-	// 실제 HTML 렌더링은 매핑된 상태 코드로 internal/errorpages 패키지에 위임합니다. (ko)
-	errorpages.Render(w, r, mapped)
+	// Delegates actual HTML rendering to internal/errorpages. (en)
+	// 실제 HTML 렌더링은 internal/errorpages 패키지에 위임합니다. (ko)
+	errorpages.Render(w, r, status)
 }
 
 // setSecurityAndIdentityHeaders 는 HopGate 에서 공통으로 추가하는 보안/식별 헤더를 설정합니다. (ko)
@@ -652,10 +641,8 @@ func newHTTPHandler(logger logging.Logger, proxyTimeout time.Duration) http.Hand
 func main() {
 	logger := logging.NewStdJSONLogger("server")
 
-	// Prometheus 메트릭 등록
-	observability.MustRegister()
-
 	// 1. 서버 설정 로드 (.env + 환경변수)
+	// internal/config 패키지가 .env 를 먼저 읽고, 이미 설정된 OS 환경변수를 우선시합니다.
 	cfg, err := config.LoadServerConfigFromEnv()
 	if err != nil {
 		logger.Error("failed to load server config from env", logging.Fields{
@@ -663,6 +650,34 @@ func main() {
 		})
 		os.Exit(1)
 	}
+
+	// 2. 필수 환경 변수 유효성 검사 (.env 포함; OS 환경변수가 우선)
+	httpListenEnv := getEnvOrPanic(logger, "HOP_SERVER_HTTP_LISTEN")
+	httpsListenEnv := getEnvOrPanic(logger, "HOP_SERVER_HTTPS_LISTEN")
+	dtlsListenEnv := getEnvOrPanic(logger, "HOP_SERVER_DTLS_LISTEN")
+	domainEnv := getEnvOrPanic(logger, "HOP_SERVER_DOMAIN")
+	debugEnv := getEnvOrPanic(logger, "HOP_SERVER_DEBUG")
+
+	// 디버깅 플래그 형식 확인
+	if debugEnv != "true" && debugEnv != "false" {
+		logger.Error("invalid value for HOP_SERVER_DEBUG; must be 'true' or 'false'", logging.Fields{
+			"env":   "HOP_SERVER_DEBUG",
+			"value": debugEnv,
+		})
+		os.Exit(1)
+	}
+
+	// 유효성 검사 결과를 구조화 로그로 출력
+	logger.Info("validated server env vars", logging.Fields{
+		"HOP_SERVER_HTTP_LISTEN":  httpListenEnv,
+		"HOP_SERVER_HTTPS_LISTEN": httpsListenEnv,
+		"HOP_SERVER_DTLS_LISTEN":  dtlsListenEnv,
+		"HOP_SERVER_DOMAIN":       domainEnv,
+		"HOP_SERVER_DEBUG":        debugEnv,
+	})
+
+	// Prometheus 메트릭 등록
+	observability.MustRegister()
 
 	logger.Info("hop-gate server starting", logging.Fields{
 		"stack":        "prometheus-loki-grafana",
