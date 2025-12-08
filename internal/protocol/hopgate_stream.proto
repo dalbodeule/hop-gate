@@ -1,0 +1,103 @@
+syntax = "proto3";
+
+package hopgate.protocol.v1;
+
+option go_package = "github.com/dalbodeule/hop-gate/internal/protocol/pb;protocolpb";
+
+// HeaderValues 는 HTTP 헤더의 다중 값 표현을 위한 래퍼입니다.
+// HeaderValues wraps multiple header values for a single HTTP header key.
+message HeaderValues {
+  repeated string values = 1;
+}
+
+// Request 는 DTLS 터널 위에서 교환되는 HTTP 요청을 표현합니다.
+// This mirrors internal/protocol.Request.
+message Request {
+  string request_id   = 1;
+  string client_id    = 2;  // optional client identifier
+  string service_name = 3;  // logical service name on the client side
+
+  string method = 4;
+  string url    = 5;
+
+  // HTTP header: map of key -> multiple values.
+  map<string, HeaderValues> header = 6;
+
+  // Raw HTTP body bytes.
+  bytes body = 7;
+}
+
+// Response 는 DTLS 터널 위에서 교환되는 HTTP 응답을 표현합니다.
+// This mirrors internal/protocol.Response.
+message Response {
+  string request_id = 1;
+  int32  status     = 2;
+
+  // HTTP header.
+  map<string, HeaderValues> header = 3;
+
+  // Raw HTTP body bytes.
+  bytes body = 4;
+
+  // Optional error description when tunneling fails.
+  string error = 5;
+}
+
+// StreamOpen 은 새로운 스트림(HTTP 요청/응답, WebSocket 등)을 여는 메시지입니다.
+// This represents opening a new stream (HTTP request/response, WebSocket, etc.).
+message StreamOpen {
+  string id = 1; // StreamID (text form)
+
+  // Which logical service / local target to use on the client side.
+  string service_name = 2;
+  string target_addr  = 3; // e.g. "127.0.0.1:8080"
+
+  // Initial HTTP-like headers (including Upgrade, etc.).
+  map<string, HeaderValues> header = 4;
+}
+
+// StreamData 는 이미 열린 스트림에 대한 단방향 데이터 프레임입니다.
+// This is a unidirectional data frame on an already-open stream.
+message StreamData {
+  string id  = 1; // StreamID
+  uint64 seq = 2; // per-stream sequence number starting from 0
+  bytes  data = 3;
+}
+
+// StreamAck 는 StreamData 에 대한 ACK/NACK 및 선택적 재전송 힌트를 전달합니다.
+// This conveys ACK/NACK and optional retransmission hints for StreamData.
+message StreamAck {
+  string id = 1;
+
+  // Last contiguously received sequence number (starting from 0).
+  uint64 ack_seq = 2;
+
+  // Additional missing sequence numbers beyond ack_seq (optional).
+  repeated uint64 lost_seqs = 3;
+
+  // Optional receive window size hint.
+  uint32 window_size = 4;
+}
+
+// StreamClose 는 스트림 종료(정상/에러)를 알립니다.
+// This indicates normal or error termination of a stream.
+message StreamClose {
+  string id    = 1;
+  string error = 2; // empty means normal close
+}
+
+// Envelope 는 DTLS 세션 위에서 교환되는 상위 레벨 메시지 컨테이너입니다.
+// 하나의 Envelope 에는 HTTP 요청/응답 또는 스트림 관련 메시지 중 하나만 포함됩니다.
+// Envelope is the top-level container exchanged over the DTLS session.
+// Exactly one payload (http_request/http_response/stream_*) is set per message.
+message Envelope {
+  oneof payload {
+    Request    http_request  = 1;
+    Response   http_response = 2;
+
+    StreamOpen  stream_open  = 3;
+    StreamData  stream_data  = 4;
+    StreamClose stream_close = 5;
+    StreamAck   stream_ack   = 6;
+  }
+}

@@ -4,19 +4,22 @@
 
 ## 1. 프로젝트 개요 (Project Overview)
 
-HopGate는 공인 서버와 여러 프라이빗 네트워크 클라이언트 사이에 **DTLS 기반 HTTP 터널**을 제공하는 게이트웨이입니다.  
+HopGate는 공인 서버와 여러 프라이빗 네트워크 클라이언트 사이에 **DTLS 기반 HTTP 터널**을 제공하는 게이트웨이입니다.
 HopGate is a gateway that provides a **DTLS-based HTTP tunnel** between a public server and multiple private-network clients.
 
 주요 특징 (Key features):
 
-- 서버는 80/443 포트를 점유하고, ACME(Let's Encrypt 등)로 TLS 인증서를 자동 발급/갱신합니다.  
+- 서버는 80/443 포트를 점유하고, ACME(Let's Encrypt 등)로 TLS 인증서를 자동 발급/갱신합니다.
   The server listens on ports 80/443 and automatically issues/renews TLS certificates via ACME (e.g. Let's Encrypt).
-- 서버–클라이언트 간 전송은 DTLS 위에서 이루어지며, HTTP 요청/응답을 메시지로 터널링합니다.  
-  Transport between server and clients uses DTLS, tunneling HTTP request/response messages.
-- 관리 Plane(REST API)을 통해 도메인 등록/해제 및 클라이언트 API Key 발급을 수행합니다.  
+- 서버–클라이언트 간 전송은 DTLS 위에서 이루어지며, 현재는 HTTP 요청/응답을 **Protobuf 기반 length-prefixed Envelope** 로 터널링합니다.
+  Transport between server and clients uses DTLS; HTTP requests/responses are tunneled as **Protobuf-based, length-prefixed envelopes**.
+- 관리 Plane(REST API)을 통해 도메인 등록/해제 및 클라이언트 API Key 발급을 수행합니다.
   An admin management plane (REST API) handles domain registration/unregistration and client API key issuance.
-- 로그는 JSON 구조 형태로 stdout 에 출력되며, Prometheus + Loki + Grafana 스택에 친화적으로 설계되었습니다.  
+- 로그는 JSON 구조 형태로 stdout 에 출력되며, Prometheus + Loki + Grafana 스택에 친화적으로 설계되었습니다.
   Logs are JSON-structured and designed to work well with a Prometheus + Loki + Grafana stack.
+
+> 참고: 대용량 HTTP 바디에 대해서는 DTLS/UDP MTU 한계 때문에 **단일 Envelope** 로는 한계가 있으므로, `progress.md` 의 3.3A 섹션에 정리된 것처럼 `StreamOpen` / `StreamData` / `StreamClose` 기반의 스트림/프레임 터널링으로 점진적으로 전환할 예정입니다. (ko)
+> Note: For very large HTTP bodies, a single-envelope model still hits DTLS/UDP MTU limits. As outlined in section 3.3A of `progress.md`, the plan is to gradually move to a stream/frame-based tunneling model using `StreamOpen` / `StreamData` / `StreamClose`. (en)
 
 아키텍처 세부 내용은 [`ARCHITECTURE.md`](ARCHITECTURE.md)에 정리되어 있습니다.  
 Detailed architecture is documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).
@@ -38,10 +41,10 @@ Detailed architecture is documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ### 3.1 의존성 (Dependencies)
 
-- Go 1.21+ 권장 (go.mod 상 버전보다 최신 Go 사용을 추천)  
+- Go 1.21+ 권장 (go.mod 상 버전보다 최신 Go 사용을 추천)
   Go 1.21+ is recommended (even if go.mod specifies an older minor).
-- PostgreSQL (추후 DomainValidator 실제 구현 시 필요)  
-  PostgreSQL (only required when implementing real domain validation).
+- PostgreSQL (관리 Plane + 실제 DomainValidator 에 필수)
+  PostgreSQL (required for the admin plane and the real DomainValidator).
 
 Go 모듈 의존성 설치 / 정리는 다음으로 수행할 수 있습니다:  
 You can install/cleanup Go module deps via:
@@ -104,11 +107,11 @@ HOP_CLIENT_LOCAL_TARGET=127.0.0.1:8080
 HOP_CLIENT_DEBUG=true
 ```
 
-- `HOP_CLIENT_SERVER_ADDR` : DTLS 서버 주소 (예: `localhost:8443`)  
+- `HOP_CLIENT_SERVER_ADDR` : DTLS 서버 주소 (예: `localhost:8443`)
   DTLS server address, e.g. `localhost:8443`.
-- `HOP_CLIENT_DOMAIN` / `HOP_CLIENT_API_KEY` : 관리 Plane 에서 발급받은 도메인/키 (현재는 DummyValidator 로 아무 값이나 허용)  
-  Domain and API key issued by the admin plane (currently any values are accepted by DummyValidator).
-- `HOP_CLIENT_LOCAL_TARGET` : 실제로 HTTP 요청을 보낼 로컬 서버 주소  
+- `HOP_CLIENT_DOMAIN` / `HOP_CLIENT_API_KEY` : 관리 Plane 에서 발급받은 도메인/키 (실제 ent + PostgreSQL 기반 DomainValidator 에 의해 검증)
+  Domain and API key issued by the admin plane (validated by a real ent + PostgreSQL based DomainValidator).
+- `HOP_CLIENT_LOCAL_TARGET` : 실제로 HTTP 요청을 보낼 로컬 서버 주소
   Local HTTP target address.
 - `HOP_CLIENT_DEBUG=true` : 서버 인증서 체인 검증을 스킵(InsecureSkipVerify)하여 self-signed 인증서를 신뢰  
   Skips server certificate chain verification (InsecureSkipVerify) and trusts the self-signed cert.
@@ -162,10 +165,14 @@ For implementation skeleton, see [`internal/admin`](internal/admin) and [`ent/sc
 
 ## 6. 주의사항 (Caveats)
 
-- `Debug=true` 설정은 **개발/테스트 용도**입니다. self-signed 인증서 및 InsecureSkipVerify 사용은 프로덕션 환경에서 절대 사용하지 마세요.  
+- `Debug=true` 설정은 **개발/테스트 용도**입니다. self-signed 인증서 및 InsecureSkipVerify 사용은 프로덕션 환경에서 절대 사용하지 마세요.
   `Debug=true` is strictly for development/testing. Do not use self-signed certs or InsecureSkipVerify in production.
-- 실제 운영 시에는 ACME 기반 인증서, PostgreSQL + ent 기반 DomainValidator, Proxy 레이어 연동 등을 완성해야 합니다.  
-  For production you must wire ACME certificates, a PostgreSQL+ent-based DomainValidator, and the proxy layer.
+- 현재 버전은 ACME 기반 인증서, PostgreSQL + ent 기반 DomainValidator, Proxy 레이어가 기본적으로 연동되어 있으나,
+  대용량 HTTP 바디에 대해서는 JSON 단일 메시지 기반 터널링 특성상 DTLS/UDP MTU 한계에 부딪힐 수 있습니다.
+  스트림/프레임 기반 DTLS 터널링으로의 전환 및 하드닝 작업은 `progress.md` 에 정의된 다음 단계에 포함되어 있습니다. (ko)
+  The current version wires ACME certificates, a PostgreSQL+ent-based DomainValidator, and the proxy layer by default,
+  but for very large HTTP bodies the JSON single-message tunneling model can still hit DTLS/UDP MTU limits.
+  Moving to a stream/frame-based DTLS tunneling model and further hardening are tracked as next steps in `progress.md`. (en)
 
-HopGate는 아직 초기 단계의 실험적 프로젝트입니다. API 및 동작은 언제든지 변경될 수 있습니다.  
+HopGate는 아직 초기 단계의 실험적 프로젝트입니다. API 및 동작은 언제든지 변경될 수 있습니다.
 HopGate is still experimental; APIs and behavior may change at any time.

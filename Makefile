@@ -66,3 +66,21 @@ docker-server:
 	@echo "Building server Docker image..."
 	docker build -f Dockerfile.server -t hop-gate-server:$(VERSION) .
 
+# --- Protobuf code generation -------------------------------------------------
+# Requires:
+#   - protoc (https://grpc.io/docs/protoc-installation/)
+#   - protoc-gen-go (go install google.golang.org/protobuf/cmd/protoc-gen-go@latest)
+#
+# Generates Go types under internal/protocol/pb from internal/protocol/hopgate_stream.proto.
+# NOTE:
+#   - go_package in hopgate_stream.proto is set to:
+#       github.com/dalbodeule/hop-gate/internal/protocol/pb;protocolpb
+#   - With --go_out=. (without paths=source_relative), protoc will place the
+#     generated file under internal/protocol/pb according to go_package.
+proto:
+	@echo "Generating Go code from Protobuf schemas..."
+	protoc \
+		--go_out=. \
+		internal/protocol/hopgate_stream.proto
+	@echo "Protobuf generation completed."
+

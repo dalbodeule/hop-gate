@@ -1,10 +1,9 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"io"
 	stdfs "io/fs"
@@ -31,8 +30,9 @@ import (
 )
 
 type dtlsSessionWrapper struct {
-	sess dtls.Session
-	mu   sync.Mutex
+	sess         dtls.Session
+	mu           sync.Mutex
+	nextStreamID uint64
 }
 
 // canonicalizeDomainForDNS 는 DTLS 핸드셰이크에서 전달된 도메인 문자열을
@@ -157,8 +157,10 @@ func parseExpectedIPsFromEnv(logger logging.Logger, envKey string) []net.IP {
 	return result
 }
 
-// ForwardHTTP 는 단일 HTTP 요청을 DTLS 세션으로 포워딩하고 응답을 돌려받습니다.
-// ForwardHTTP forwards a single HTTP request over the DTLS session and returns the response.
+// ForwardHTTP 는 HTTP 요청을 DTLS 세션 위의 StreamOpen/StreamData/StreamClose 프레임으로 전송하고,
+// 역방향 스트림 응답을 수신해 protocol.Response 로 반환합니다. (ko)
+// ForwardHTTP forwards an HTTP request over the DTLS session using StreamOpen/StreamData/StreamClose
+// frames and reconstructs the reverse stream into a protocol.Response. (en)
 func (w *dtlsSessionWrapper) ForwardHTTP(ctx context.Context, logger logging.Logger, req *http.Request, serviceName string) (*protocol.Response, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -167,88 +169,220 @@ func (w *dtlsSessionWrapper) ForwardHTTP(ctx context.Context, logger logging.Log
 		ctx = context.Background()
 	}
 
-	// 요청 본문 읽기
-	var body []byte
-	if req.Body != nil {
-		b, err := io.ReadAll(req.Body)
-		if err != nil {
-			return nil, err
-		}
-		body = b
-	}
+	codec := protocol.DefaultCodec
 
-	// 간단한 RequestID 생성 (실제 서비스에서는 UUID 등을 사용하는 것이 좋음)
-	requestID := time.Now().UTC().Format("20060102T150405.000000000")
-
-	httpReq := &protocol.Request{
-		RequestID:   requestID,
-		ClientID:    "", // TODO: 클라이언트 식별자 도입 시 채우기
-		ServiceName: serviceName,
-		Method:      req.Method,
-		URL:         req.URL.String(),
-		Header:      req.Header.Clone(),
-		Body:        body,
-	}
+	// 세션 내에서 고유한 StreamID 를 생성합니다. (ko)
+	// Generate a unique StreamID for this HTTP request within the DTLS session. (en)
+	streamID := w.nextHTTPStreamID()
 
 	log := logger.With(logging.Fields{
 		"component":  "http_to_dtls",
-		"request_id": requestID,
+		"request_id": string(streamID),
 		"method":     req.Method,
 		"url":        req.URL.String(),
 	})
 
-	log.Info("forwarding http request over dtls", logging.Fields{
+	log.Info("forwarding http request over dtls (stream mode)", logging.Fields{
 		"host":   req.Host,
 		"scheme": req.URL.Scheme,
 	})
 
-	// HTTP 요청을 Envelope 로 감싸서 전송합니다.
-	env := &protocol.Envelope{
-		Type:        protocol.MessageTypeHTTP,
-		HTTPRequest: httpReq,
+	// 요청 헤더를 복사하고 pseudo-header 로 HTTP 메타데이터를 추가합니다. (ko)
+	// Copy request headers and attach HTTP metadata as pseudo-headers. (en)
+	hdr := make(map[string][]string, len(req.Header)+3)
+	for k, vs := range req.Header {
+		hdr[k] = append([]string(nil), vs...)
+	}
+	hdr[protocol.HeaderKeyMethod] = []string{req.Method}
+	if req.URL != nil {
+		hdr[protocol.HeaderKeyURL] = []string{req.URL.String()}
+	}
+	host := req.Host
+	if host == "" && req.URL != nil {
+		host = req.URL.Host
+	}
+	if host != "" {
+		hdr[protocol.HeaderKeyHost] = []string{host}
 	}
 
-	enc := json.NewEncoder(w.sess)
-	if err := enc.Encode(env); err != nil {
-		log.Error("failed to encode http envelope", logging.Fields{
+	// StreamOpen 전송: 어떤 서비스로 라우팅해야 하는지와 초기 헤더를 전달합니다. (ko)
+	// Send StreamOpen to indicate which service to route to and initial headers. (en)
+	openEnv := &protocol.Envelope{
+		Type: protocol.MessageTypeStreamOpen,
+		StreamOpen: &protocol.StreamOpen{
+			ID:         streamID,
+			Service:    serviceName,
+			TargetAddr: "",
+			Header:     hdr,
+		},
+	}
+	if err := codec.Encode(w.sess, openEnv); err != nil {
+		log.Error("failed to encode stream_open envelope", logging.Fields{
 			"error": err.Error(),
 		})
 		return nil, err
 	}
 
-	// 클라이언트로부터 HTTP 응답 Envelope 를 수신합니다.
-	var respEnv protocol.Envelope
+	// 요청 바디를 4KiB(StreamChunkSize) 단위로 잘라 StreamData 프레임으로 전송합니다. (ko)
+	// Chunk the request body into 4KiB (StreamChunkSize) StreamData frames. (en)
+	var seq uint64
+	if req.Body != nil {
+		buf := make([]byte, protocol.StreamChunkSize)
+		for {
+			n, err := req.Body.Read(buf)
+			if n > 0 {
+				dataCopy := append([]byte(nil), buf[:n]...)
+				dataEnv := &protocol.Envelope{
+					Type: protocol.MessageTypeStreamData,
+					StreamData: &protocol.StreamData{
+						ID:   streamID,
+						Seq:  seq,
+						Data: dataCopy,
+					},
+				}
+				if err2 := codec.Encode(w.sess, dataEnv); err2 != nil {
+					log.Error("failed to encode stream_data envelope", logging.Fields{
+						"error": err2.Error(),
+					})
+					return nil, err2
+				}
+				seq++
+			}
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return nil, fmt.Errorf("read http request body for streaming: %w", err)
+			}
+		}
+	}
 
-	// NOTE: pion/dtls 는 복호화된 애플리케이션 데이터를 호출자가 제공한 버퍼에 채웁니다.
-	// 기본 JSON 디코더 버퍼만 사용하면 큰 HTTP 응답/Envelope 에서 "dtls: buffer too small"
-	// 오류가 발생할 수 있으므로, 충분히 큰 bufio.Reader(64KiB)를 사용합니다. (ko)
-	// NOTE: pion/dtls decrypts application data into the buffer provided by the caller.
-	// Using only the default JSON decoder buffer can cause "dtls: buffer too small"
-	// errors for large HTTP responses/envelopes, so we wrap the session with a
-	// reasonably large bufio.Reader (64KiB). (en)
-	dec := json.NewDecoder(bufio.NewReaderSize(w.sess, 64*1024))
-	if err := dec.Decode(&respEnv); err != nil {
-		log.Error("failed to decode http envelope", logging.Fields{
+	// 바디 종료를 알리는 StreamClose 를 전송합니다. (ko)
+	// Send StreamClose to mark the end of the request body. (en)
+	closeReqEnv := &protocol.Envelope{
+		Type: protocol.MessageTypeStreamClose,
+		StreamClose: &protocol.StreamClose{
+			ID:    streamID,
+			Error: "",
+		},
+	}
+	if err := codec.Encode(w.sess, closeReqEnv); err != nil {
+		log.Error("failed to encode request stream_close envelope", logging.Fields{
 			"error": err.Error(),
 		})
 		return nil, err
 	}
 
-	if respEnv.Type != protocol.MessageTypeHTTP || respEnv.HTTPResponse == nil {
-		log.Error("received non-http envelope from client", logging.Fields{
-			"type": respEnv.Type,
-		})
-		return nil, fmt.Errorf("unexpected envelope type %q or empty http_response", respEnv.Type)
+	// 클라이언트로부터 역방향 스트림 응답을 수신합니다. (ko)
+	// Receive reverse stream response (StreamOpen + StreamData* + StreamClose). (en)
+	var (
+		resp       protocol.Response
+		bodyBuf    bytes.Buffer
+		gotOpen    bool
+		statusCode = http.StatusOK
+	)
+
+	resp.RequestID = string(streamID)
+	resp.Header = make(map[string][]string)
+
+	for {
+		var env protocol.Envelope
+		if err := codec.Decode(w.sess, &env); err != nil {
+			log.Error("failed to decode stream response envelope", logging.Fields{
+				"error": err.Error(),
+			})
+			return nil, err
+		}
+
+		switch env.Type {
+		case protocol.MessageTypeStreamOpen:
+			so := env.StreamOpen
+			if so == nil {
+				return nil, fmt.Errorf("stream_open response payload is nil")
+			}
+			if so.ID != streamID {
+				return nil, fmt.Errorf("unexpected stream_open for id %q (expected %q)", so.ID, streamID)
+			}
+			// 상태 코드 및 헤더 복원 (pseudo-header 제거). (ko)
+			// Restore status code and headers (strip pseudo-headers). (en)
+			statusStr := firstHeaderValue(so.Header, protocol.HeaderKeyStatus, strconv.Itoa(http.StatusOK))
+			if sc, err := strconv.Atoi(statusStr); err == nil && sc > 0 {
+				statusCode = sc
+			}
+			for k, vs := range so.Header {
+				if k == protocol.HeaderKeyMethod ||
+					k == protocol.HeaderKeyURL ||
+					k == protocol.HeaderKeyHost ||
+					k == protocol.HeaderKeyStatus {
+					continue
+				}
+				resp.Header[k] = append([]string(nil), vs...)
+			}
+			gotOpen = true
+
+		case protocol.MessageTypeStreamData:
+			sd := env.StreamData
+			if sd == nil {
+				return nil, fmt.Errorf("stream_data response payload is nil")
+			}
+			if sd.ID != streamID {
+				return nil, fmt.Errorf("unexpected stream_data for id %q (expected %q)", sd.ID, streamID)
+			}
+			if len(sd.Data) > 0 {
+				if _, err := bodyBuf.Write(sd.Data); err != nil {
+					return nil, fmt.Errorf("buffer stream_data response: %w", err)
+				}
+			}
+
+		case protocol.MessageTypeStreamClose:
+			sc := env.StreamClose
+			if sc == nil {
+				return nil, fmt.Errorf("stream_close response payload is nil")
+			}
+			if sc.ID != streamID {
+				return nil, fmt.Errorf("unexpected stream_close for id %q (expected %q)", sc.ID, streamID)
+			}
+			// 스트림 종료: 지금까지 수신한 헤더/바디로 protocol.Response 를 완성합니다. (ko)
+			// Stream finished: complete protocol.Response using collected headers/body. (en)
+			resp.Status = statusCode
+			resp.Body = bodyBuf.Bytes()
+			resp.Error = sc.Error
+
+			log.Info("received stream http response over dtls", logging.Fields{
+				"status": resp.Status,
+				"error":  resp.Error,
+			})
+			if !gotOpen {
+				return nil, fmt.Errorf("received stream_close without prior stream_open for stream %q", streamID)
+			}
+			return &resp, nil
+
+		default:
+			return nil, fmt.Errorf("unexpected envelope type %q in stream response", env.Type)
+		}
 	}
+}
 
-	protoResp := respEnv.HTTPResponse
+// nextHTTPStreamID 는 DTLS 세션 내 HTTP 요청에 사용할 고유 StreamID 를 생성합니다. (ko)
+// nextHTTPStreamID generates a unique StreamID for HTTP requests on this DTLS session. (en)
+func (w *dtlsSessionWrapper) nextHTTPStreamID() protocol.StreamID {
+	id := w.nextStreamID
+	w.nextStreamID++
+	return protocol.StreamID(fmt.Sprintf("http-%d", id))
+}
 
-	log.Info("received dtls response", logging.Fields{
-		"status": protoResp.Status,
-		"error":  protoResp.Error,
-	})
-
-	return protoResp, nil
+// firstHeaderValue 는 map[string][]string 형태의 헤더에서 첫 번째 값을 반환하고,
+// 값이 없으면 기본값을 반환합니다. (ko)
+// firstHeaderValue returns the first value for a header key in map[string][]string,
+// or the provided default if the key is missing or empty. (en)
+func firstHeaderValue(hdr map[string][]string, key, def string) string {
+	if hdr == nil {
+		return def
+	}
+	if vs, ok := hdr[key]; ok && len(vs) > 0 {
+		return vs[0]
+	}
+	return def
 }
 
 var (
@@ -277,8 +411,8 @@ var hopGateOwnedHeaders = map[string]struct{}{
 	"Referrer-Policy":           {},
 }
 
-// writeErrorPage 는 주요 HTTP 에러 코드(400/404/500/525)에 대해 정적 HTML 에러 페이지를 렌더링합니다. (ko)
-// writeErrorPage renders static HTML error pages for key HTTP error codes (400/404/500/525). (en)
+// writeErrorPage 는 주요 HTTP 에러 코드(400/404/500/502/504/525)에 대해 정적 HTML 에러 페이지를 렌더링합니다. (ko)
+// writeErrorPage renders static HTML error pages for key HTTP error codes (400/404/500/502/504/525). (en)
 //
 // 템플릿 로딩 우선순위: (ko)
 //  1. HOP_ERROR_PAGES_DIR/<status>.html (또는 ./errors/<status>.html) (ko)
@@ -294,9 +428,31 @@ func writeErrorPage(w http.ResponseWriter, r *http.Request, status int) {
 		setSecurityAndIdentityHeaders(w, r)
 	}
 
-	// Delegates actual HTML rendering to internal/errorpages. (en)
-	// 실제 HTML 렌더링은 internal/errorpages 패키지에 위임합니다. (ko)
-	errorpages.Render(w, r, status)
+	// 4xx / 5xx 대역에 대한 템플릿 매핑 규칙: (ko)
+	// - 400 series: 400.html 로 렌더링 (단, 404 는 404.html 사용) (ko)
+	// - 500 series: 500.html 로 렌더링 (단, 502/504/525 는 개별 템플릿 사용) (ko)
+	//
+	// Mapping rules for 4xx / 5xx ranges: (en)
+	// - 400 series: render using 400.html (except 404 uses 404.html). (en)
+	// - 500 series: render using 500.html (except 502/504/525 which have dedicated templates). (en)
+	mapped := status
+	switch {
+	case status >= 400 && status < 500:
+		if status != http.StatusBadRequest && status != http.StatusNotFound {
+			mapped = http.StatusBadRequest
+		}
+	case status >= 500 && status < 600:
+		if status != http.StatusInternalServerError &&
+			status != http.StatusBadGateway &&
+			status != errorpages.StatusGatewayTimeout &&
+			status != errorpages.StatusTLSHandshakeFailed {
+			mapped = http.StatusInternalServerError
+		}
+	}
+
+	// Delegates actual HTML rendering to internal/errorpages with mapped status. (en)
+	// 실제 HTML 렌더링은 매핑된 상태 코드로 internal/errorpages 패키지에 위임합니다. (ko)
+	errorpages.Render(w, r, mapped)
 }
 
 // setSecurityAndIdentityHeaders 는 HopGate 에서 공통으로 추가하는 보안/식별 헤더를 설정합니다. (ko)

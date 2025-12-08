@@ -7,12 +7,14 @@ This document tracks implementation progress against the HopGate architecture an
 
 ## 1. High-level Status / 상위 수준 상태
 
-- 아키텍처 문서 및 README 정리 완료 (ko/en 병기).  
-  Architecture and README are documented in both Korean and English.  
-- 서버/클라이언트 엔트리 포인트, DTLS 핸드셰이크, 기본 PostgreSQL/ent 스키마까지 1차 뼈대 구현 완료.  
-  First skeleton implementation is done for server/client entrypoints, DTLS handshake, and basic PostgreSQL/ent schema.  
-- 실제 Proxy 동작(HTTP ↔ DTLS 터널링), Admin API의 비즈니스 로직, 실 ACME 연동 등은 아직 남아 있음.  
-  Actual proxying (HTTP ↔ DTLS tunneling), admin API business logic, and real ACME integration are still pending.  
+- 아키텍처 문서 및 README 정리 완료 (ko/en 병기).
+  Architecture and README are documented in both Korean and English.
+- 서버/클라이언트 엔트리 포인트, DTLS 핸드셰이크, 기본 PostgreSQL/ent 스키마까지 1차 뼈대 구현 완료.
+  First skeleton implementation is done for server/client entrypoints, DTLS handshake, and basic PostgreSQL/ent schema.
+- 기본 Proxy 동작(HTTP ↔ DTLS 터널링), Admin API 비즈니스 로직, ACME 기반 인증서 관리는 구현 완료된 상태.
+  Core proxying (HTTP ↔ DTLS tunneling), admin API business logic, and ACME-based certificate management are implemented.
+- 스트림 ARQ, Observability, Hardening, ACME 고급 전략 등은 아직 남아 있는 다음 단계 작업이다.
+  Stream-level ARQ, observability, hardening, and advanced ACME operational strategies remain as next-step work items.
 
 ---
 
@@ -39,12 +41,12 @@ This document tracks implementation progress against the HopGate architecture an
 
 ### 2.2 Server / Client Entrypoints
 
-- 서버 메인: [`cmd/server/main.go`](cmd/server/main.go)  
-  - 서버 설정 로드 (`LoadServerConfigFromEnv`).  
-  - PostgreSQL 연결 및 ent 스키마 init (`store.OpenPostgresFromEnv`).  
-  - Debug 모드 시 self-signed localhost cert 생성 (`dtls.NewSelfSignedLocalhostConfig`).  
-  - DTLS 서버 생성 (`dtls.NewPionServer`) 및 Accept + Handshake 루프 (`PerformServerHandshake`).  
-  - DummyDomainValidator 사용해 도메인/API Key 조합을 임시로 모두 허용.  
+- 서버 메인: [`cmd/server/main.go`](cmd/server/main.go)
+  - 서버 설정 로드 (`LoadServerConfigFromEnv`).
+  - PostgreSQL 연결 및 ent 스키마 init (`store.OpenPostgresFromEnv`).
+  - Debug 모드 시 self-signed localhost cert 생성 (`dtls.NewSelfSignedLocalhostConfig`).
+  - DTLS 서버 생성 (`dtls.NewPionServer`) 및 Accept + Handshake 루프 (`PerformServerHandshake`).
+  - ent 기반 `DomainValidator` + `domainGateValidator` 를 사용해 `(domain, client_api_key)` 조합과 DNS/IP(옵션) 검증을 수행.
 
 - 클라이언트 메인: [`cmd/client/main.go`](cmd/client/main.go)  
   - CLI + env 병합 설정 (우선순위: CLI > env).  
@@ -115,13 +117,13 @@ This document tracks implementation progress against the HopGate architecture an
   - `RegisterDomain(ctx, domain, memo) (clientAPIKey string, err error)`  
   - `UnregisterDomain(ctx, domain, clientAPIKey string) error`  
 
-- HTTP Handler: [`internal/admin/http.go`](internal/admin/http.go)  
-  - `Authorization: Bearer {ADMIN_API_KEY}` 검증.  
+- HTTP Handler: [`internal/admin/http.go`](internal/admin/http.go)
+  - `Authorization: Bearer {ADMIN_API_KEY}` 검증.
   - 엔드포인트:
-    - `POST /api/v1/admin/domains/register`  
-    - `POST /api/v1/admin/domains/unregister`  
-  - JSON request/response 구조 정의 및 기본 에러 처리.  
-  - 아직 실제 서비스/라우터 wiring, ent 기반 구현 미완성.  
+    - `POST /api/v1/admin/domains/register`
+    - `POST /api/v1/admin/domains/unregister`
+  - JSON request/response 구조 정의 및 기본 에러 처리.
+  - 실제 서비스(`DomainService`) 및 라우터 wiring, ent 기반 구현이 완료되어 도메인 등록/해제가 동작.
 
 ---
 
@@ -224,10 +226,11 @@ This document tracks implementation progress against the HopGate architecture an
 
 ### 3.3 Proxy Core / HTTP Tunneling
 
-- [x] 서버 측 Proxy 구현 확장: [`internal/proxy/server.go`](internal/proxy/server.go)
-  - HTTP/HTTPS 리스너와 DTLS 세션 매핑 구현.
-  - `Router` 구현체 추가 (도메인/패스 → 클라이언트/서비스).
-  - 요청/응답을 `internal/protocol` 구조체로 직렬화/역직렬화.
+- [ ] 서버 측 Proxy 구현 확장: [`internal/proxy/server.go`](internal/proxy/server.go)
+  - 현재 `ServerProxy` / `Router` 인터페이스와 `NewHTTPServer` 만 정의되어 있고,
+    실제 HTTP/HTTPS 리스너와 DTLS 세션 매핑 로직은 [`cmd/server/main.go`](cmd/server/main.go) 의
+    `newHTTPHandler` / `dtlsSessionWrapper.ForwardHTTP` 안에 위치합니다.
+  - Proxy 코어 로직을 proxy 레이어로 이동하는 리팩터링은 아직 진행되지 않았습니다. (3.6 항목과 연동)
 
 - [x] 클라이언트 측 Proxy 구현 확장: [`internal/proxy/client.go`](internal/proxy/client.go)
   - DTLS 세션에서 `protocol.Request` 수신 → 로컬 HTTP 호출 → `protocol.Response` 전송 루프 구현.
@@ -239,6 +242,164 @@ This document tracks implementation progress against the HopGate architecture an
 
 - [x] 클라이언트 main 에 Proxy loop wiring 추가: [`cmd/client/main.go`](cmd/client/main.go)
   - handshake 성공 후 `proxy.ClientProxy.StartLoop` 실행.
+
+#### 3.3A Stream-based DTLS Tunneling / 스트림 기반 DTLS 터널링
+
+초기 HTTP 터널링 설계는 **단일 JSON Envelope + 단일 DTLS 쓰기** 방식(요청/응답 바디 전체를 한 번에 전송)이었고,
+대용량 응답 바디에서 UDP MTU 한계로 인한 `sendto: message too long` 문제가 발생할 수 있었습니다.
+이 한계를 제거하기 위해, 현재 코드는 DTLS 위 애플리케이션 프로토콜을 **스트림/프레임 기반**으로 재설계하여 `StreamOpen` / `StreamData` / `StreamClose` 를 사용합니다.
+The initial tunneling model used a **single JSON envelope + single DTLS write per HTTP message**, which could hit UDP MTU limits (`sendto: message too long`) for large bodies.
+The current implementation uses a **stream/frame-based** protocol over DTLS (`StreamOpen` / `StreamData` / `StreamClose`), and this section documents its constraints and further improvements (e.g. ARQ).
+
+고려해야 할 제약 / Constraints:
+
+- 전송 계층은 DTLS(pion/dtls)를 유지합니다.
+  The transport layer must remain DTLS (pion/dtls).
+- JSON 기반 단일 Envelope 모델에서 벗어나, HTTP 바디를 안전한 크기의 chunk 로 나누어 전송해야 합니다.
+  We must move away from the single-envelope JSON model and chunk HTTP bodies under a safe MTU.
+- UDP 특성상 일부 프레임 손실/오염에 대비해, **해당 chunk 만 재전송 요청할 수 있는 ARQ 메커니즘**이 필요합니다.
+  Given UDP characteristics, we need an application-level ARQ so that **only lost/corrupted chunks are retransmitted**.
+
+아래 단계들은 `feature/udp-stream` 브랜치에서 구현할 구체적인 작업 항목입니다.
+The following tasks describe concrete work items to be implemented on the `feature/udp-stream` branch.
+
+---
+
+##### 3.3A.1 스트림 프레이밍 프로토콜 설계 (JSON 1단계)
+##### 3.3A.1 Stream framing protocol (JSON, phase 1)
+
+- [x] 스트림 프레임 타입 정리 및 확장: [`internal/protocol/protocol.go`](internal/protocol/protocol.go:35)
+  - 이미 정의된 스트림 관련 타입을 1단계에서 적극 활용합니다.
+    Reuse the already defined stream-related types in phase 1:
+    - `MessageTypeStreamOpen`, `MessageTypeStreamData`, `MessageTypeStreamClose`
+    - [`Envelope`](internal/protocol/protocol.go:52), [`StreamOpen`](internal/protocol/protocol.go:69), [`StreamData`](internal/protocol/protocol.go:80), [`StreamClose`](internal/protocol/protocol.go:86)
+  - `StreamData` 에 per-stream 시퀀스 번호를 추가합니다.
+    Add a per-stream sequence number to `StreamData`:
+    - 예시 / Example:
+      ```go
+      type StreamData struct {
+      	ID   StreamID `json:"id"`
+      	Seq  uint64   `json:"seq"`  // 0부터 시작하는 per-stream sequence
+      	Data []byte   `json:"data"`
+      }
+      ```
+
+- [x] 스트림 ACK / 재전송 제어 메시지 추가: [`internal/protocol/protocol.go`](internal/protocol/protocol.go:52)
+  - 선택적 재전송(Selective Retransmission)을 위해 `StreamAck` 메시지와 `MessageTypeStreamAck` 를 추가합니다.
+    Add `StreamAck` message and `MessageTypeStreamAck` for selective retransmission:
+    ```go
+    const (
+    	MessageTypeStreamAck MessageType = "stream_ack"
+    )
+
+    type StreamAck struct {
+    	ID         StreamID `json:"id"`              // 대상 스트림 / target stream
+    	AckSeq     uint64   `json:"ack_seq"`        // 연속으로 수신 완료한 마지막 Seq / last contiguous sequence
+    	LostSeqs   []uint64 `json:"lost_seqs"`      // 누락된 시퀀스 목록(선택) / optional list of missing seqs
+    	WindowSize uint32   `json:"window_size"`    // 선택: 허용 in-flight 프레임 수 / optional receive window
+    }
+    ```
+  - [`Envelope`](internal/protocol/protocol.go:52)에 `StreamAck *StreamAck` 필드를 추가합니다.
+    Extend `Envelope` with a `StreamAck *StreamAck` field.
+
+- [x] MTU-safe chunk 크기 정의
+	- DTLS/UDP 헤더 및 Protobuf/length-prefix 오버헤드를 고려해 안전한 payload 크기(4KiB)를 상수로 정의합니다.
+		Define a safe payload size constant (4KiB) considering DTLS/UDP headers and Protobuf/length-prefix framing.
+	- 이 값은 [`internal/protocol/protocol.go`](internal/protocol/protocol.go:32) 의 `StreamChunkSize` 로 정의되었습니다.
+		Implemented as `StreamChunkSize` in [`internal/protocol/protocol.go`](internal/protocol/protocol.go:32).
+	- 이후 HTTP 바디 스트림 터널링 구현 시, 모든 `StreamData.Data` 는 이 크기 이하 chunk 로 잘라 전송해야 합니다.
+		In the stream tunneling implementation, every `StreamData.Data` must be sliced into chunks no larger than this size.
+
+---
+
+##### 3.3A.2 애플리케이션 레벨 ARQ 설계 (Selective Retransmission)
+##### 3.3A.2 Application-level ARQ (Selective Retransmission)
+
+- [x] 수신 측 ARQ 상태 관리 구현
+  - 스트림별로 `expectedSeq`, out-of-order chunk 버퍼(`received`), 누락 시퀀스 집합(`lost`)을 유지하면서,
+    in-order / out-of-order 프레임을 구분해 HTTP 바디 버퍼에 순서대로 쌓습니다.
+  - For each stream, maintain `expectedSeq`, an out-of-order buffer (`received`), and a lost-sequence set (`lost`),
+    delivering in-order frames directly to the HTTP body buffer while buffering/reordering out-of-order ones.
+
+- [x] 수신 측 StreamAck 전송 정책 구현
+  - 각 `StreamData` 수신 시점에 `AckSeq = expectedSeq - 1` 과 현재 윈도우에서 누락된 시퀀스 일부(`LostSeqs`, 상한 개수 적용)를 포함한
+    `StreamAck{AckSeq, LostSeqs}` 를 전송해 선택적 재전송을 유도합니다.
+  - On every `StreamData` frame, send `StreamAck{AckSeq, LostSeqs}` where `AckSeq = expectedSeq - 1` and `LostSeqs`
+    contains a bounded set (up to a fixed limit) of missing sequence numbers in the current receive window.
+
+- [x] 송신 측 재전송 로직 구현 (StreamAck 기반)
+  - 응답 스트림 송신 측에서 스트림별 `streamSender` 를 두고, `outstanding[seq] = payload` 로 아직 Ack 되지 않은 프레임을 추적합니다.
+  - `StreamAck{AckSeq, LostSeqs}` 수신 시:
+    - `seq <= AckSeq` 인 항목은 모두 제거하고,
+    - `LostSeqs` 에 포함된 시퀀스에 대해서만 `StreamData{ID, Seq, Data}` 를 재전송합니다.
+  - A per-stream `streamSender` tracks `outstanding[seq] = payload` for unacknowledged frames. Upon receiving
+    `StreamAck{AckSeq, LostSeqs}`, it deletes all `seq <= AckSeq` and retransmits only frames whose sequence
+    numbers appear in `LostSeqs`.
+
+> Note: 현재 구현은 StreamAck 기반 **선택적 재전송(Selective Retransmission)** 까지 포함하며,
+> 별도의 RTO(재전송 타이머) 기반 백그라운드 재전송 루프는 향후 확장 여지로 남겨둔 상태입니다.
+> Note: The current implementation covers StreamAck-based **selective retransmission**; a separate RTO-based
+> background retransmission loop is left as a potential future enhancement.
+
+---
+
+##### 3.3A.3 HTTP ↔ 스트림 매핑 (서버/클라이언트)
+##### 3.3A.3 HTTP ↔ stream mapping (server/client)
+
+- [x] 서버 → 클라이언트 요청 스트림: [`cmd/server/main.go`](cmd/server/main.go:200)
+  - `ForwardHTTP` 는 스트림 기반 HTTP 요청/응답을 처리하도록 구현되어 있으며, 동작은 다음과 같습니다.
+    `ForwardHTTP` is implemented in stream mode and behaves as follows:
+    - HTTP 요청 수신 시:
+      - 새로운 `StreamID` 를 발급합니다 (세션별 증가).
+        Generate a new `StreamID` per incoming HTTP request on the DTLS session.
+      - `StreamOpen` 전송:
+        - 요청 메서드/URL/헤더를 [`StreamOpen`](internal/protocol/protocol.go:69) 의 `Header` 혹은 pseudo-header 로 encode.
+          Encode method/URL/headers into `StreamOpen.Header` or a pseudo-header scheme.
+      - 요청 바디를 읽으면서 `StreamData{ID, Seq, Data}` 를 지속적으로 전송합니다.
+        Read the HTTP request body and send it as a sequence of `StreamData` frames.
+      - 바디 종료 시 `StreamClose{ID, Error:""}` 를 전송합니다.
+        When the body ends, send `StreamClose{ID, Error:""}`.
+    - 응답 수신:
+      - 클라이언트에서 오는 역방향 `StreamOpen` 으로 HTTP status/header 를 수신하고,
+        이를 `http.ResponseWriter` 에 반영합니다.
+        Receive response status/headers via reverse-direction `StreamOpen` and map them to `http.ResponseWriter`.
+      - 연속되는 `StreamData` 를 수신할 때마다 `http.ResponseWriter.Write` 로 chunk 를 바로 전송합니다.
+        For each `StreamData`, write the chunk directly to the HTTP response.
+      - `StreamClose` 수신 시 응답 종료 및 스트림 자원 정리.
+        On `StreamClose`, finish the response and clean up per-stream state.
+
+- [x] 클라이언트에서의 요청 처리 스트림: [`internal/proxy/client.go`](internal/proxy/client.go:200)
+  - 서버로부터 들어오는 `StreamOpen{ID, ...}` 을 수신하면,
+    새로운 goroutine 을 띄워 해당 ID에 대한 로컬 HTTP 요청을 수행합니다.
+    On receiving `StreamOpen{ID, ...}` from the server, spawn a goroutine to handle the local HTTP request for that stream ID.
+  - 스트림별로 `io.Pipe` 또는 채널 기반 바디 리더를 준비하고,
+    `StreamData` 프레임을 수신할 때마다 이 파이프에 쓰도록 합니다.
+    Prepare an `io.Pipe` (or channel-backed reader) per stream and write incoming `StreamData` chunks into it.
+  - 로컬 HTTP 클라이언트 응답은 반대로:
+    For the local HTTP client response:
+    - 응답 status/header → `StreamOpen` (client → server)
+    - 응답 바디 → 여러 개의 `StreamData`
+    - 종료 시점에 `StreamClose` 전송
+      Send `StreamOpen` (status/headers), then a sequence of `StreamData`, followed by `StreamClose` when done.
+
+---
+
+##### 3.3A.4 JSON → 바이너리 직렬화로의 잠재적 전환 (2단계)
+##### 3.3A.4 JSON → binary serialization (potential phase 2)
+
+- [x] JSON 기반 스트림 프로토콜의 1단계 구현/안정화 이후, 직렬화 포맷 재검토 및 Protobuf 전환
+  - 현재는 JSON 대신 Protobuf length-prefix `Envelope` 포맷을 기본으로 사용합니다.
+    The runtime now uses a Protobuf-based, length-prefixed `Envelope` format instead of JSON.
+  - HTTP/스트림 payload 는 여전히 MTU-safe 크기(예: 4KiB, `StreamChunkSize`)로 제한되어 있어, 단일 프레임이 과도하게 커지지 않습니다.
+    HTTP/stream payloads remain bounded to an MTU-safe size (e.g. 4KiB via `StreamChunkSize`), so individual frames stay small.
+- [x] length-prefix 이진 프레임(Protobuf)으로 전환
+  - 동일한 logical model (`StreamOpen` / `StreamData(seq)` / `StreamClose` / `StreamAck`)을 유지한 채,
+    wire-format 을 Protobuf length-prefix binary 프레이밍으로 교체했고, 이는 `protobufCodec` 으로 구현되었습니다.
+    We now keep the same logical model while using Protobuf length-prefixed framing via `protobufCodec`.
+- [x] 이 전환은 `internal/protocol` 내 직렬화 레이어를 얇은 abstraction 으로 감싸 구현했습니다.
+  - [`internal/protocol/codec.go`](internal/protocol/codec.go:130) 에 `WireCodec` 인터페이스와 Protobuf 기반 `DefaultCodec` 을 도입해,
+    호출자는 `protocol.DefaultCodec` 만 사용하고, JSON codec 은 보조 용도로만 남아 있습니다.
+    In [`internal/protocol/codec.go`](internal/protocol/codec.go:130), the `WireCodec` abstraction and Protobuf-based `DefaultCodec` allow callers to use only `protocol.DefaultCodec` while JSON remains as an auxiliary codec.
 
 ---
 
@@ -261,10 +422,10 @@ This document tracks implementation progress against the HopGate architecture an
 
 ### 3.5 Observability / 관측성
 
-- [ ] Prometheus 메트릭 노출 및 서버 wiring
+- [x] Prometheus 메트릭 노출 및 서버 wiring
   - `cmd/server/main.go` 에 Prometheus `/metrics` 엔드포인트 추가 (예: promhttp.Handler).
-  - DTLS 세션 수, DTLS 핸드셰이크 성공/실패 수, HTTP/Proxy 요청 수 및 에러 수에 대한 카운터/게이지 메트릭 정의.
-  - 도메인, 클라이언트 ID, request_id 등의 라벨 설계 및 현재 구조적 로깅 필드와 일관성 유지.
+  - DTLS 핸드셰이크 성공/실패 수, HTTP 요청 수, HTTP 요청 지연, Proxy 에러 수에 대한 메트릭을 정의합니다.
+  - 메트릭 라벨은 메서드/상태 코드/결과/에러 타입 등에 한정되며, 도메인/클라이언트 ID/request_id 는 구조적 로그 필드로만 노출됩니다.
 
 - [ ] Loki/Grafana 대시보드 및 쿼리 예시
   - Loki/Promtail 구성을 가정한 주요 로그 쿼리 예시 정리(도메인, 클라이언트 ID, request_id 기준).
@@ -301,9 +462,11 @@ This document tracks implementation progress against the HopGate architecture an
 
 ### Milestone 2 — Full HTTP Tunneling (프락시 동작 완성)
 
-- [ ] 서버 Proxy 코어 구현 및 HTTPS ↔ DTLS 라우팅.  
-- [ ] 클라이언트 Proxy 루프 구현 및 로컬 서비스 연동.  
-- [ ] End-to-end HTTP 요청/응답 터널링 E2E 테스트.  
+- [x] 서버 Proxy 코어 구현 및 HTTPS ↔ DTLS 라우팅.
+  - 현재 `cmd/server/main.go` 의 `newHTTPHandler` / `dtlsSessionWrapper.ForwardHTTP` 경로에서 동작합니다.
+- [x] 클라이언트 Proxy 루프 구현 및 로컬 서비스 연동.
+  - `cmd/client/main.go` + [`ClientProxy.StartLoop()`](internal/proxy/client.go:59) 를 통해 DTLS 세션 위에서 로컬 서비스와 연동됩니다.
+- [ ] End-to-end HTTP 요청/응답 터널링 E2E 테스트.
 
 ### Milestone 3 — ACME + TLS/DTLS 정식 인증
 
@@ -313,7 +476,10 @@ This document tracks implementation progress against the HopGate architecture an
 
 ### Milestone 4 — Observability & Hardening
 
-- [ ] Prometheus/Loki/Grafana 통합.  
+- [ ] Prometheus/Loki/Grafana 통합.
+  - Prometheus 메트릭 정의 및 `/metrics` 엔드포인트는 이미 구현 및 동작 중이며,
+    Loki/Promtail/Grafana 대시보드 및 운영 통합 작업은 아직 남아 있습니다.
+
 - [ ] 에러/리트라이/타임아웃 정책 정교화.  
 - [ ] 보안/구성 최종 점검 및 문서화.  
 
