@@ -192,18 +192,25 @@ func (p *ClientProxy) forwardToLocal(ctx context.Context, preq *protocol.Request
 	}
 
 	// DTLS over UDP has an upper bound on packet size (~64KiB). 전체 HTTP 바디를
-	// 하나의 JSON Envelope 로 감싸 전송하는 현재 설계에서는 바디가 너무 크면
+	// 하나의 Envelope 로 감싸 전송하는 현재 설계에서는, 바디가 너무 크면
 	// OS 레벨에서 "message too long" (EMSGSIZE) 가 발생할 수 있습니다. (ko)
 	//
-	// 이를 피하기 위해, 터널링 가능한 바디 크기에 상한을 두고, 이를 초과하는
-	// 응답은 502 Bad Gateway + HopGate 전용 에러 메시지로 대체합니다. (ko)
+	// 이를 피하기 위해, 터널링 가능한 **단일 HTTP 바디** 크기에 상한을 두고,
+	// 이를 초과하는 응답은 502 Bad Gateway + HopGate 전용 에러 메시지로 대체합니다. (ko)
 	//
 	// DTLS over UDP has an upper bound on datagram size (~64KiB). With the current
-	// design (wrapping the entire HTTP body into a single JSON envelope), very
-	// large bodies can trigger "message too long" (EMSGSIZE) at the OS level.
-	// To avoid this, we cap the tunneled body size and replace oversized responses
-	// with a 502 Bad Gateway + HopGate-specific error body. (en)
-	const maxTunnelBodyBytes = 48 * 1024 // 48KiB, conservative under UDP limits
+	// single-envelope design, very large bodies can still trigger "message too long"
+	// (EMSGSIZE) at the OS level. To avoid this, we cap the tunneled HTTP body size
+	// and replace oversized responses with a 502 Bad Gateway + HopGate-specific
+	// error body. (en)
+	//
+	// Protobuf 기반 터널링에서는 향후 StreamData(4KiB) 단위로 나누어 전송할 예정이지만,
+	// 그 전 단계에서도 body 자체를 4KiB( StreamChunkSize )로 하드 리밋하여
+	// Proto message body 필드가 지나치게 커지지 않도록 합니다. (ko)
+	//
+	// Even before full stream tunneling is implemented, we hard-limit the protobuf
+	// body field to 4KiB (StreamChunkSize) so that individual messages remain small. (en)
+	const maxTunnelBodyBytes = protocol.StreamChunkSize
 
 	limited := &io.LimitedReader{
 		R: res.Body,

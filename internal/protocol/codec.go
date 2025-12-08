@@ -57,6 +57,24 @@ func (protobufCodec) Encode(w io.Writer, env *Envelope) error {
 	if err != nil {
 		return err
 	}
+
+	// Body/stream payload 하드 리밋: 4KiB (StreamChunkSize).
+	// HTTP 단일 Envelope 및 스트림 기반 프레임 모두에서 payload 가 이 값을 넘지 않도록 강제합니다.
+	// Enforce a 4KiB hard limit (StreamChunkSize) for HTTP bodies and stream payloads.
+	switch env.Type {
+	case MessageTypeHTTP:
+		if env.HTTPRequest != nil && len(env.HTTPRequest.Body) > int(StreamChunkSize) {
+			return fmt.Errorf("protobuf codec: http request body too large: %d bytes (max %d)", len(env.HTTPRequest.Body), StreamChunkSize)
+		}
+		if env.HTTPResponse != nil && len(env.HTTPResponse.Body) > int(StreamChunkSize) {
+			return fmt.Errorf("protobuf codec: http response body too large: %d bytes (max %d)", len(env.HTTPResponse.Body), StreamChunkSize)
+		}
+	case MessageTypeStreamData:
+		if env.StreamData != nil && len(env.StreamData.Data) > int(StreamChunkSize) {
+			return fmt.Errorf("protobuf codec: stream data payload too large: %d bytes (max %d)", len(env.StreamData.Data), StreamChunkSize)
+		}
+	}
+
 	data, err := proto.Marshal(pbEnv)
 	if err != nil {
 		return fmt.Errorf("protobuf marshal envelope: %w", err)
