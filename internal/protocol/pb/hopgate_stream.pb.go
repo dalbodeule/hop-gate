@@ -4,7 +4,7 @@
 // 	protoc        v6.33.1
 // source: internal/protocol/hopgate_stream.proto
 
-package protocolpb
+package pb
 
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
