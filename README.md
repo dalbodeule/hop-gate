@@ -11,15 +11,15 @@ HopGate is a gateway that provides a **DTLS-based HTTP tunnel** between a public
 
 - 서버는 80/443 포트를 점유하고, ACME(Let's Encrypt 등)로 TLS 인증서를 자동 발급/갱신합니다.
   The server listens on ports 80/443 and automatically issues/renews TLS certificates via ACME (e.g. Let's Encrypt).
-- 서버–클라이언트 간 전송은 DTLS 위에서 이루어지며, 현재는 HTTP 요청/응답을 JSON 기반 메시지로 터널링합니다.
-  Transport between server and clients uses DTLS; currently HTTP requests/responses are tunneled as JSON-based messages.
+- 서버–클라이언트 간 전송은 DTLS 위에서 이루어지며, 현재는 HTTP 요청/응답을 **Protobuf 기반 length-prefixed Envelope** 로 터널링합니다.
+  Transport between server and clients uses DTLS; HTTP requests/responses are tunneled as **Protobuf-based, length-prefixed envelopes**.
 - 관리 Plane(REST API)을 통해 도메인 등록/해제 및 클라이언트 API Key 발급을 수행합니다.
   An admin management plane (REST API) handles domain registration/unregistration and client API key issuance.
 - 로그는 JSON 구조 형태로 stdout 에 출력되며, Prometheus + Loki + Grafana 스택에 친화적으로 설계되었습니다.
   Logs are JSON-structured and designed to work well with a Prometheus + Loki + Grafana stack.
 
-> 참고: 대용량 HTTP 바디에 대해서는 DTLS/UDP MTU 한계 때문에 스트림/프레임 기반 프로토콜로의 전환을 계획하고 있습니다. 자세한 내용은 `progress.md` 의 3.3A 섹션을 참고하세요. (ko)
-> Note: For very large HTTP bodies, we plan to move to a stream/frame-based protocol over DTLS due to UDP MTU limits. See section 3.3A in `progress.md` for details. (en)
+> 참고: 대용량 HTTP 바디에 대해서는 DTLS/UDP MTU 한계 때문에 **단일 Envelope** 로는 한계가 있으므로, `progress.md` 의 3.3A 섹션에 정리된 것처럼 `StreamOpen` / `StreamData` / `StreamClose` 기반의 스트림/프레임 터널링으로 점진적으로 전환할 예정입니다. (ko)
+> Note: For very large HTTP bodies, a single-envelope model still hits DTLS/UDP MTU limits. As outlined in section 3.3A of `progress.md`, the plan is to gradually move to a stream/frame-based tunneling model using `StreamOpen` / `StreamData` / `StreamClose`. (en)
 
 아키텍처 세부 내용은 [`ARCHITECTURE.md`](ARCHITECTURE.md)에 정리되어 있습니다.  
 Detailed architecture is documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).

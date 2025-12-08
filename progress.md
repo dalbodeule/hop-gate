@@ -299,11 +299,13 @@ The following tasks describe concrete work items to be implemented on the `featu
   - [`Envelope`](internal/protocol/protocol.go:52)에 `StreamAck *StreamAck` 필드를 추가합니다.
     Extend `Envelope` with a `StreamAck *StreamAck` field.
 
-- [ ] MTU-safe chunk 크기 정의
-  - DTLS/UDP 헤더, JSON 인코딩 오버헤드를 고려해 안전한 payload 크기(예: 4KiB)를 상수로 정의합니다.
-    Define a safe payload size constant (e.g. 4KiB) considering DTLS/UDP headers and JSON overhead.
-  - 모든 HTTP 바디는 이 크기 이하의 chunk 로 잘라 `StreamData.Data` 에 담아 전송합니다.
-    All HTTP bodies must be sliced into chunks no larger than this and carried in `StreamData.Data`.
+- [x] MTU-safe chunk 크기 정의
+	- DTLS/UDP 헤더 및 Protobuf/length-prefix 오버헤드를 고려해 안전한 payload 크기(4KiB)를 상수로 정의합니다.
+		Define a safe payload size constant (4KiB) considering DTLS/UDP headers and Protobuf/length-prefix framing.
+	- 이 값은 [`internal/protocol/protocol.go`](internal/protocol/protocol.go:32) 의 `StreamChunkSize` 로 정의되었습니다.
+		Implemented as `StreamChunkSize` in [`internal/protocol/protocol.go`](internal/protocol/protocol.go:32).
+	- 이후 HTTP 바디 스트림 터널링 구현 시, 모든 `StreamData.Data` 는 이 크기 이하 chunk 로 잘라 전송해야 합니다.
+		In the stream tunneling implementation, every `StreamData.Data` must be sliced into chunks no larger than this size.
 
 ---
 
