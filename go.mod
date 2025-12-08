@@ -6,7 +6,6 @@ require (
 	entgo.io/ent v0.14.5
 	github.com/go-acme/lego/v4 v4.28.1
 	github.com/google/uuid v1.6.0
-	github.com/joho/godotenv v1.5.1
 	github.com/lib/pq v1.10.9
 	github.com/pion/dtls/v3 v3.0.7
 	github.com/prometheus/client_golang v1.19.0

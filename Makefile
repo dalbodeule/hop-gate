@@ -71,7 +71,7 @@ docker-server:
 	docker build -f Dockerfile.server -t hop-gate-server:$(VERSION) .
 
 check-env-server:
-	@if [ -z "$$HOP_SERVER_HTTP_LISTEN" ]; then echo "필수 환경 변수 HOP_SERVER_HTTP_LISTEN가 설정되지 않았습니다."; exit 1; fi
+	@if [ -z "$$HOP_SERVER_HTTP_LISTEN" ]; then echo "필수 환경 변수 HOP_SERVER_HTTP_LISTEN이 설정되지 않았습니다."; exit 1; fi
 	@if [ -z "$$HOP_SERVER_HTTPS_LISTEN" ]; then echo "필수 환경 변수 HOP_SERVER_HTTPS_LISTEN가 설정되지 않았습니다."; exit 1; fi
 	@if [ -z "$$HOP_SERVER_DTLS_LISTEN" ]; then echo "필수 환경 변수 HOP_SERVER_DTLS_LISTEN가 설정되지 않았습니다."; exit 1; fi
 	@if [ -z "$$HOP_SERVER_DOMAIN" ]; then echo "필수 환경 변수 HOP_SERVER_DOMAIN가 설정되지 않았습니다."; exit 1; fi
