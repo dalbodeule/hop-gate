@@ -32,6 +32,11 @@ type Response struct {
 // MessageType 은 DTLS 위에서 교환되는 상위 레벨 메시지 종류를 나타냅니다.
 type MessageType string
 
+// StreamChunkSize 는 스트림 터널링 시 단일 StreamData 프레임에 담을 최대 payload 크기입니다.
+// 현재 구현에서는 4KiB 로 고정하여 DTLS/UDP MTU 한계를 여유 있게 피하도록 합니다.
+// StreamChunkSize is the maximum payload size per StreamData frame (4KiB).
+const StreamChunkSize = 4 * 1024
+
 const (
 	// MessageTypeHTTP 는 기존 단일 HTTP 요청/응답 메시지를 의미합니다.
 	// 이 경우 HTTPRequest / HTTPResponse 필드를 사용합니다.
@@ -75,6 +80,15 @@ type Envelope struct {
 
 // StreamID 는 스트림(예: 특정 WebSocket 연결 또는 TCP 커넥션)을 구분하기 위한 식별자입니다.
 type StreamID string
+
+// HTTP-over-stream 터널링에서 사용되는 pseudo-header 키 상수입니다.
+// These pseudo-header keys are used when tunneling HTTP over the stream protocol.
+const (
+	HeaderKeyMethod = "X-HopGate-Method"
+	HeaderKeyURL    = "X-HopGate-URL"
+	HeaderKeyHost   = "X-HopGate-Host"
+	HeaderKeyStatus = "X-HopGate-Status"
+)
 
 // StreamOpen 은 새로운 스트림을 여는 요청을 나타냅니다.
 type StreamOpen struct {

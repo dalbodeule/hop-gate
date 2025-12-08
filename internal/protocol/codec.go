@@ -114,8 +114,7 @@ func (protobufCodec) Decode(r io.Reader, env *Envelope) error {
 var DefaultCodec WireCodec = protobufCodec{}
 
 // toProtoEnvelope 는 내부 Envelope 구조체를 Protobuf Envelope 로 변환합니다.
-// 현재 구현은 MessageTypeHTTP (HTTPRequest/HTTPResponse) 만 지원하며,
-// 스트림 관련 타입은 이후 스트림 터널링 구현 단계에서 확장합니다.
+// 현재 구현은 HTTP 요청/응답 및 스트림 관련 타입(StreamOpen/StreamData/StreamClose/StreamAck)을 지원합니다.
 func toProtoEnvelope(env *Envelope) (*protocolpb.Envelope, error) {
 	switch env.Type {
 	case MessageTypeHTTP:
@@ -164,15 +163,80 @@ func toProtoEnvelope(env *Envelope) (*protocolpb.Envelope, error) {
 			}, nil
 		}
 		return nil, fmt.Errorf("protobuf codec: http envelope has neither request nor response")
+	case MessageTypeStreamOpen:
+		if env.StreamOpen == nil {
+			return nil, fmt.Errorf("protobuf codec: stream_open envelope missing payload")
+		}
+		so := env.StreamOpen
+		pbSO := &protocolpb.StreamOpen{
+			Id:          string(so.ID),
+			ServiceName: so.Service,
+			TargetAddr:  so.TargetAddr,
+			Header:      make(map[string]*protocolpb.HeaderValues, len(so.Header)),
+		}
+		for k, vs := range so.Header {
+			hv := &protocolpb.HeaderValues{
+				Values: append([]string(nil), vs...),
+			}
+			pbSO.Header[k] = hv
+		}
+		return &protocolpb.Envelope{
+			Payload: &protocolpb.Envelope_StreamOpen{
+				StreamOpen: pbSO,
+			},
+		}, nil
+	case MessageTypeStreamData:
+		if env.StreamData == nil {
+			return nil, fmt.Errorf("protobuf codec: stream_data envelope missing payload")
+		}
+		sd := env.StreamData
+		pbSD := &protocolpb.StreamData{
+			Id:   string(sd.ID),
+			Seq:  sd.Seq,
+			Data: sd.Data,
+		}
+		return &protocolpb.Envelope{
+			Payload: &protocolpb.Envelope_StreamData{
+				StreamData: pbSD,
+			},
+		}, nil
+	case MessageTypeStreamClose:
+		if env.StreamClose == nil {
+			return nil, fmt.Errorf("protobuf codec: stream_close envelope missing payload")
+		}
+		sc := env.StreamClose
+		pbSC := &protocolpb.StreamClose{
+			Id:    string(sc.ID),
+			Error: sc.Error,
+		}
+		return &protocolpb.Envelope{
+			Payload: &protocolpb.Envelope_StreamClose{
+				StreamClose: pbSC,
+			},
+		}, nil
+	case MessageTypeStreamAck:
+		if env.StreamAck == nil {
+			return nil, fmt.Errorf("protobuf codec: stream_ack envelope missing payload")
+		}
+		sa := env.StreamAck
+		pbSA := &protocolpb.StreamAck{
+			Id:         string(sa.ID),
+			AckSeq:     sa.AckSeq,
+			LostSeqs:   append([]uint64(nil), sa.LostSeqs...),
+			WindowSize: sa.WindowSize,
+		}
+		return &protocolpb.Envelope{
+			Payload: &protocolpb.Envelope_StreamAck{
+				StreamAck: pbSA,
+			},
+		}, nil
 	default:
-		// 스트림 관련 타입은 아직 DTLS 스트림 터널링 구현 이전 단계이므로 지원하지 않습니다.
-		// Stream-based message types are not yet supported by the protobuf codec.
 		return nil, fmt.Errorf("protobuf codec: unsupported envelope type %q", env.Type)
 	}
 }
 
 // fromProtoEnvelope 는 Protobuf Envelope 를 내부 Envelope 구조체로 변환합니다.
-// 현재 구현은 HTTP 요청/응답만 지원합니다.
+// 현재 구현은 HTTP 요청/응답 및 스트림 관련 타입(StreamOpen/StreamData/StreamClose/StreamAck)을 지원합니다.
 func fromProtoEnvelope(pbEnv *protocolpb.Envelope, env *Envelope) error {
 	switch payload := pbEnv.Payload.(type) {
 	case *protocolpb.Envelope_HttpRequest:
@@ -198,6 +262,10 @@ func fromProtoEnvelope(pbEnv *protocolpb.Envelope, env *Envelope) error {
 			Body:        append([]byte(nil), req.Body...),
 		}
 		env.HTTPResponse = nil
+		env.StreamOpen = nil
+		env.StreamData = nil
+		env.StreamClose = nil
+		env.StreamAck = nil
 		return nil
 
 	case *protocolpb.Envelope_HttpResponse:
@@ -221,6 +289,90 @@ func fromProtoEnvelope(pbEnv *protocolpb.Envelope, env *Envelope) error {
 			Error:     resp.Error,
 		}
 		env.HTTPRequest = nil
+		env.StreamOpen = nil
+		env.StreamData = nil
+		env.StreamClose = nil
+		env.StreamAck = nil
+		return nil
+
+	case *protocolpb.Envelope_StreamOpen:
+		so := payload.StreamOpen
+		if so == nil {
+			return fmt.Errorf("protobuf codec: stream_open payload is nil")
+		}
+		hdr := make(map[string][]string, len(so.Header))
+		for k, hv := range so.Header {
+			if hv == nil {
+				continue
+			}
+			hdr[k] = append([]string(nil), hv.Values...)
+		}
+		env.Type = MessageTypeStreamOpen
+		env.StreamOpen = &StreamOpen{
+			ID:         StreamID(so.Id),
+			Service:    so.ServiceName,
+			TargetAddr: so.TargetAddr,
+			Header:     hdr,
+		}
+		env.StreamData = nil
+		env.StreamClose = nil
+		env.StreamAck = nil
+		env.HTTPRequest = nil
+		env.HTTPResponse = nil
+		return nil
+
+	case *protocolpb.Envelope_StreamData:
+		sd := payload.StreamData
+		if sd == nil {
+			return fmt.Errorf("protobuf codec: stream_data payload is nil")
+		}
+		env.Type = MessageTypeStreamData
+		env.StreamData = &StreamData{
+			ID:   StreamID(sd.Id),
+			Seq:  sd.Seq,
+			Data: append([]byte(nil), sd.Data...),
+		}
+		env.StreamOpen = nil
+		env.StreamClose = nil
+		env.StreamAck = nil
+		env.HTTPRequest = nil
+		env.HTTPResponse = nil
+		return nil
+
+	case *protocolpb.Envelope_StreamClose:
+		sc := payload.StreamClose
+		if sc == nil {
+			return fmt.Errorf("protobuf codec: stream_close payload is nil")
+		}
+		env.Type = MessageTypeStreamClose
+		env.StreamClose = &StreamClose{
+			ID:    StreamID(sc.Id),
+			Error: sc.Error,
+		}
+		env.StreamOpen = nil
+		env.StreamData = nil
+		env.StreamAck = nil
+		env.HTTPRequest = nil
+		env.HTTPResponse = nil
+		return nil
+
+	case *protocolpb.Envelope_StreamAck:
+		sa := payload.StreamAck
+		if sa == nil {
+			return fmt.Errorf("protobuf codec: stream_ack payload is nil")
+		}
+		env.Type = MessageTypeStreamAck
+		env.StreamAck = &StreamAck{
+			ID:         StreamID(sa.Id),
+			AckSeq:     sa.AckSeq,
+			LostSeqs:   append([]uint64(nil), sa.LostSeqs...),
+			WindowSize: sa.WindowSize,
+		}
+		env.StreamOpen = nil
+		env.StreamData = nil
+		env.StreamClose = nil
+		env.HTTPRequest = nil
+		env.HTTPResponse = nil
 		return nil
 
 	default:
