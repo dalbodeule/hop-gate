@@ -20,6 +20,10 @@ CLIENT_BIN := $(BIN_DIR)/hop-gate-client
 
 VERSION ?= $(shell git describe --tags --dirty --always 2>/dev/null || echo dev)
 
+# .env 파일 로드
+include .env
+export $(shell sed 's/=.*//' .env)
+
 .PHONY: all server client clean docker-server run-server run-client errors-css
 
 all: server client
@@ -65,6 +69,19 @@ run-client: client
 docker-server:
 	@echo "Building server Docker image..."
 	docker build -f Dockerfile.server -t hop-gate-server:$(VERSION) .
+
+check-env-server:
+	@if [ -z "$$HOP_SERVER_HTTP_LISTEN" ]; then echo "필수 환경 변수 HOP_SERVER_HTTP_LISTEN이 설정되지 않았습니다."; exit 1; fi
+	@if [ -z "$$HOP_SERVER_HTTPS_LISTEN" ]; then echo "필수 환경 변수 HOP_SERVER_HTTPS_LISTEN가 설정되지 않았습니다."; exit 1; fi
+	@if [ -z "$$HOP_SERVER_DTLS_LISTEN" ]; then echo "필수 환경 변수 HOP_SERVER_DTLS_LISTEN가 설정되지 않았습니다."; exit 1; fi
+	@if [ -z "$$HOP_SERVER_DOMAIN" ]; then echo "필수 환경 변수 HOP_SERVER_DOMAIN가 설정되지 않았습니다."; exit 1; fi
+
+check-env-client:
+	@if [ -z "$$HOP_CLIENT_SERVER_ADDR" ]; then echo "필수 환경 변수 HOP_CLIENT_SERVER_ADDR가 설정되지 않았습니다."; exit 1; fi
+	@if [ -z "$$HOP_CLIENT_DOMAIN" ]; then echo "필수 환경 변수 HOP_CLIENT_DOMAIN가 설정되지 않았습니다."; exit 1; fi
+	@if [ -z "$$HOP_CLIENT_API_KEY" ]; then echo "필수 환경 변수 HOP_CLIENT_API_KEY가 설정되지 않았습니다."; exit 1; fi
+	@if [ -z "$$HOP_CLIENT_LOCAL_TARGET" ]; then echo "필수 환경 변수 HOP_CLIENT_LOCAL_TARGET가 설정되지 않았습니다."; exit 1; fi
+	@if [ -z "$$HOP_CLIENT_DEBUG" ]; then echo "필수 환경 변수 HOP_CLIENT_DEBUG가 설정되지 않았습니다."; exit 1; fi
 
 # --- Protobuf code generation -------------------------------------------------
 # Requires:

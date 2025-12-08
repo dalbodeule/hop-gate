@@ -107,7 +107,11 @@ func loadDotEnvOnce() {
 			val = strings.Trim(val, `"'`)
 
 			if key != "" {
-				_ = os.Setenv(key, val)
+				// 이미 OS 환경변수에 설정된 값이 있는 경우 이를 우선시하고,
+				// 비어 있는 키에 대해서만 .env 값을 주입합니다.
+				if _, exists := os.LookupEnv(key); !exists {
+					_ = os.Setenv(key, val)
+				}
 			}
 		}
 		if err := scanner.Err(); err != nil {
@@ -209,7 +213,8 @@ func loadLoggingFromEnv() LoggingConfig {
 	}
 }
 
-// LoadServerConfigFromEnv 는 .env 를 우선 읽고, 이후 환경 변수를 기반으로 서버 설정을 구성합니다.
+// LoadServerConfigFromEnv 는 .env 를 한 번 읽어 현재 환경변수를 보완한 뒤
+// "환경변수 > .env" 우선순위로 서버 설정을 구성합니다.
 func LoadServerConfigFromEnv() (*ServerConfig, error) {
 	loadDotEnvOnce()
 	if dotenvErr != nil {
@@ -228,7 +233,8 @@ func LoadServerConfigFromEnv() (*ServerConfig, error) {
 	return cfg, nil
 }
 
-// LoadClientConfigFromEnv 는 .env 를 우선 읽고, 이후 환경 변수를 기반으로 클라이언트 설정을 구성합니다.
+// LoadClientConfigFromEnv 는 .env 를 한 번 읽어 현재 환경변수를 보완한 뒤
+// "환경변수 > .env" 우선순위로 클라이언트 설정을 구성합니다.
 // 실제 런타임에서 사용되는 필드는 ServerAddr, Domain, ClientAPIKey, LocalTarget 입니다.
 func LoadClientConfigFromEnv() (*ClientConfig, error) {
 	loadDotEnvOnce()

@@ -15,6 +15,17 @@ import (
 	"github.com/dalbodeule/hop-gate/internal/proxy"
 )
 
+func getEnvOrPanic(logger logging.Logger, key string) string {
+	value, exists := os.LookupEnv(key)
+	if !exists || strings.TrimSpace(value) == "" {
+		logger.Error("missing required environment variable", logging.Fields{
+			"env": key,
+		})
+		os.Exit(1)
+	}
+	return value
+}
+
 // maskAPIKey 는 로그에 노출할 때 클라이언트 API Key 를 일부만 보여주기 위한 헬퍼입니다.
 func maskAPIKey(key string) string {
 	if len(key) <= 8 {
@@ -36,15 +47,8 @@ func firstNonEmpty(values ...string) string {
 func main() {
 	logger := logging.NewStdJSONLogger("client")
 
-	// CLI 인자 정의 (env 보다 우선 적용됨)
-	serverAddrFlag := flag.String("server-addr", "", "DTLS server address (host:port)")
-	domainFlag := flag.String("domain", "", "registered domain (e.g. api.example.com)")
-	apiKeyFlag := flag.String("api-key", "", "client API key for the domain (64 chars)")
-	localTargetFlag := flag.String("local-target", "", "local HTTP target (host:port), e.g. 127.0.0.1:8080")
-
-	flag.Parse()
-
 	// 1. 환경변수(.env 포함)에서 클라이언트 설정 로드
+	// internal/config 패키지가 .env 를 먼저 읽고, 이미 설정된 OS 환경변수를 우선시합니다.
 	envCfg, err := config.LoadClientConfigFromEnv()
 	if err != nil {
 		logger.Error("failed to load client config from env", logging.Fields{
@@ -52,6 +56,39 @@ func main() {
 		})
 		os.Exit(1)
 	}
+
+	// 2. 필수 환경 변수 유효성 검사 (.env 포함; OS 환경변수가 우선)
+	serverAddrEnv := getEnvOrPanic(logger, "HOP_CLIENT_SERVER_ADDR")
+	clientDomainEnv := getEnvOrPanic(logger, "HOP_CLIENT_DOMAIN")
+	apiKeyEnv := getEnvOrPanic(logger, "HOP_CLIENT_API_KEY")
+	localTargetEnv := getEnvOrPanic(logger, "HOP_CLIENT_LOCAL_TARGET")
+	debugEnv := getEnvOrPanic(logger, "HOP_CLIENT_DEBUG")
+
+	// 디버깅 플래그 형식 확인
+	if debugEnv != "true" && debugEnv != "false" {
+		logger.Error("invalid value for HOP_CLIENT_DEBUG; must be 'true' or 'false'", logging.Fields{
+			"env":   "HOP_CLIENT_DEBUG",
+			"value": debugEnv,
+		})
+		os.Exit(1)
+	}
+
+	// 유효성 검사 결과를 구조화 로그로 출력
+	logger.Info("validated client env vars", logging.Fields{
+		"HOP_CLIENT_SERVER_ADDR":  serverAddrEnv,
+		"HOP_CLIENT_DOMAIN":       clientDomainEnv,
+		"HOP_CLIENT_API_KEY_MASK": maskAPIKey(apiKeyEnv),
+		"HOP_CLIENT_LOCAL_TARGET": localTargetEnv,
+		"HOP_CLIENT_DEBUG":        debugEnv,
+	})
+
+	// CLI 인자 정의 (env 보다 우선 적용됨)
+	serverAddrFlag := flag.String("server-addr", "", "DTLS server address (host:port)")
+	domainFlag := flag.String("domain", "", "registered domain (e.g. api.example.com)")
+	apiKeyFlag := flag.String("api-key", "", "client API key for the domain (64 chars)")
+	localTargetFlag := flag.String("local-target", "", "local HTTP target (host:port), e.g. 127.0.0.1:8080")
+
+	flag.Parse()
 
 	// 2. CLI 인자 우선, env 후순위로 최종 설정 구성
 	finalCfg := &config.ClientConfig{
