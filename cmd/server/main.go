@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"io"
 	stdfs "io/fs"
@@ -208,8 +206,7 @@ func (w *dtlsSessionWrapper) ForwardHTTP(ctx context.Context, logger logging.Log
 		HTTPRequest: httpReq,
 	}
 
-	enc := json.NewEncoder(w.sess)
-	if err := enc.Encode(env); err != nil {
+	if err := protocol.DefaultCodec.Encode(w.sess, env); err != nil {
 		log.Error("failed to encode http envelope", logging.Fields{
 			"error": err.Error(),
 		})
@@ -218,16 +215,7 @@ func (w *dtlsSessionWrapper) ForwardHTTP(ctx context.Context, logger logging.Log
 
 	// 클라이언트로부터 HTTP 응답 Envelope 를 수신합니다.
 	var respEnv protocol.Envelope
-
-	// NOTE: pion/dtls 는 복호화된 애플리케이션 데이터를 호출자가 제공한 버퍼에 채웁니다.
-	// 기본 JSON 디코더 버퍼만 사용하면 큰 HTTP 응답/Envelope 에서 "dtls: buffer too small"
-	// 오류가 발생할 수 있으므로, 충분히 큰 bufio.Reader(64KiB)를 사용합니다. (ko)
-	// NOTE: pion/dtls decrypts application data into the buffer provided by the caller.
-	// Using only the default JSON decoder buffer can cause "dtls: buffer too small"
-	// errors for large HTTP responses/envelopes, so we wrap the session with a
-	// reasonably large bufio.Reader (64KiB). (en)
-	dec := json.NewDecoder(bufio.NewReaderSize(w.sess, 64*1024))
-	if err := dec.Decode(&respEnv); err != nil {
+	if err := protocol.DefaultCodec.Decode(w.sess, &respEnv); err != nil {
 		log.Error("failed to decode http envelope", logging.Fields{
 			"error": err.Error(),
 		})

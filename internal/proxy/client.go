@@ -1,10 +1,8 @@
 package proxy
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -67,10 +65,10 @@ func (p *ClientProxy) StartLoop(ctx context.Context, sess dtls.Session) error {
 	// "dtls: buffer too small" 오류가 날 수 있으므로, 여기서는 여유 있는 버퍼(64KiB)를 사용합니다. (ko)
 	// NOTE: pion/dtls decrypts application data into the buffer provided by the caller.
 	// Using only the default JSON decoder buffer (a few hundred bytes) can trigger
-	// "dtls: buffer too small" for large HTTP bodies/envelopes, so we wrap the
-	// session with a reasonably large bufio.Reader (64KiB). (en)
-	dec := json.NewDecoder(bufio.NewReaderSize(sess, 64*1024))
-	enc := json.NewEncoder(sess)
+	// "dtls: buffer too small" for large HTTP bodies/envelopes. The default
+	// JSON-based WireCodec internally wraps the DTLS session with a 64KiB
+	// bufio.Reader, matching this requirement. (en)
+	codec := protocol.DefaultCodec
 
 	for {
 		select {
@@ -83,7 +81,7 @@ func (p *ClientProxy) StartLoop(ctx context.Context, sess dtls.Session) error {
 		}
 
 		var env protocol.Envelope
-		if err := dec.Decode(&env); err != nil {
+		if err := codec.Decode(sess, &env); err != nil {
 			if err == io.EOF {
 				log.Info("dtls session closed by server", nil)
 				return nil
@@ -135,7 +133,7 @@ func (p *ClientProxy) StartLoop(ctx context.Context, sess dtls.Session) error {
 			HTTPResponse: &resp,
 		}
 
-		if err := enc.Encode(&respEnv); err != nil {
+		if err := codec.Encode(sess, &respEnv); err != nil {
 			logReq.Error("failed to encode http response envelope", logging.Fields{
 				"error": err.Error(),
 			})
