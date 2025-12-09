@@ -51,7 +51,10 @@ func (jsonCodec) Decode(r io.Reader, env *Envelope) error {
 type protobufCodec struct{}
 
 // Encode 는 Envelope 를 Protobuf Envelope 로 변환한 뒤, length-prefix 프레이밍으로 기록합니다.
+// DTLS는 UDP 기반이므로, length prefix와 protobuf 데이터를 단일 버퍼로 합쳐 하나의 Write로 전송합니다.
 // Encode encodes an Envelope as a length-prefixed protobuf message.
+// For DTLS (UDP-based), we combine the length prefix and protobuf data into a single buffer
+// and send it with a single Write call to preserve message boundaries.
 func (protobufCodec) Encode(w io.Writer, env *Envelope) error {
 	pbEnv, err := toProtoEnvelope(env)
 	if err != nil {
@@ -83,58 +86,55 @@ func (protobufCodec) Encode(w io.Writer, env *Envelope) error {
 		return fmt.Errorf("protobuf codec: empty marshaled envelope")
 	}
 
-	var lenBuf [4]byte
 	if len(data) > int(^uint32(0)) {
 		return fmt.Errorf("protobuf codec: envelope too large: %d bytes", len(data))
 	}
-	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(data)))
 
-	if _, err := w.Write(lenBuf[:]); err != nil {
-		return fmt.Errorf("protobuf codec: write length prefix: %w", err)
-	}
-	if _, err := w.Write(data); err != nil {
-		return fmt.Errorf("protobuf codec: write payload: %w", err)
+	// DTLS 환경에서는 length prefix와 protobuf 데이터를 단일 버퍼로 합쳐서 하나의 Write로 전송
+	// For DTLS, combine length prefix and protobuf data into a single buffer
+	frame := make([]byte, 4+len(data))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(data)))
+	copy(frame[4:], data)
+
+	if _, err := w.Write(frame); err != nil {
+		return fmt.Errorf("protobuf codec: write frame: %w", err)
 	}
 	return nil
 }
 
 // Decode 는 length-prefix 프레임에서 Protobuf Envelope 를 읽어들여
 // 내부 Envelope 구조체로 변환합니다.
+// DTLS는 UDP 기반이므로, 한 번의 Read로 전체 데이터그램을 읽습니다.
 // Decode reads a length-prefixed protobuf Envelope and converts it into the internal Envelope.
+// For DTLS (UDP-based), we read the entire datagram in a single Read call.
 func (protobufCodec) Decode(r io.Reader, env *Envelope) error {
-	// IMPORTANT:
-	// pion/dtls 는 복호화된 애플리케이션 데이터를 호출자가 제공한 버퍼에 한 번에 채웁니다.
-	// 너무 작은 버퍼(예: 4바이트 len prefix)로 직접 Read 를 호출하면
-	// "dtls: buffer is too small" (temporary) 에러가 발생할 수 있습니다.
-	//
-	// 이를 피하기 위해, DTLS 세션 위에서는 항상 충분히 큰 bufio.Reader 로 래핑한 뒤
-	// io.ReadFull 을 사용합니다. 이렇게 하면 하위 DTLS Conn.Read 는
-	// 내부 버퍼 크기(defaultDecoderBufferSize, 64KiB)만큼 읽고,
-	// 그 위에서 length-prefix 를 안전하게 처리할 수 있습니다.
-	br, ok := r.(*bufio.Reader)
-	if !ok {
-		br = bufio.NewReaderSize(r, defaultDecoderBufferSize)
+	// DTLS는 메시지 경계가 보존되는 UDP 기반 프로토콜입니다.
+	// 한 번의 Read로 전체 데이터그램(length prefix + protobuf data)을 읽어야 합니다.
+	// DTLS is a UDP-based protocol that preserves message boundaries.
+	// We must read the entire datagram (length prefix + protobuf data) in a single Read call.
+	buf := make([]byte, maxProtoEnvelopeBytes+4)
+	n, err := r.Read(buf)
+	if err != nil {
+		return fmt.Errorf("protobuf codec: read frame: %w", err)
+	}
+	if n < 4 {
+		return fmt.Errorf("protobuf codec: frame too short: %d bytes", n)
 	}
 
-	var lenBuf [4]byte
-	if _, err := io.ReadFull(br, lenBuf[:]); err != nil {
-		return fmt.Errorf("protobuf codec: read length prefix: %w", err)
-	}
-	n := binary.BigEndian.Uint32(lenBuf[:])
-	if n == 0 {
+	// Extract and validate the length prefix
+	length := binary.BigEndian.Uint32(buf[:4])
+	if length == 0 {
 		return fmt.Errorf("protobuf codec: zero-length envelope")
 	}
-	if n > maxProtoEnvelopeBytes {
-		return fmt.Errorf("protobuf codec: envelope too large: %d bytes (max %d)", n, maxProtoEnvelopeBytes)
+	if length > maxProtoEnvelopeBytes {
+		return fmt.Errorf("protobuf codec: envelope too large: %d bytes (max %d)", length, maxProtoEnvelopeBytes)
 	}
-
-	buf := make([]byte, int(n))
-	if _, err := io.ReadFull(br, buf); err != nil {
-		return fmt.Errorf("protobuf codec: read payload: %w", err)
+	if int(length) != n-4 {
+		return fmt.Errorf("protobuf codec: length mismatch: expected %d, got %d", length, n-4)
 	}
 
 	var pbEnv protocolpb.Envelope
-	if err := proto.Unmarshal(buf, &pbEnv); err != nil {
+	if err := proto.Unmarshal(buf[4:n], &pbEnv); err != nil {
 		return fmt.Errorf("protobuf codec: unmarshal envelope: %w", err)
 	}
 
