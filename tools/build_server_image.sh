@@ -1,43 +1,57 @@
-. #!/usr/bin/env bash
+#!/bin/sh
 
-set -euo pipefail
+# POSIX sh 버전의 hop-gate 서버 이미지 빌드 스크립트.
+# VERSION 은 현재 git 커밋의 7글자 SHA 를 사용합니다.
 
-# Build hop-gate server image from Dockerfile.server.
-# VERSION is derived from current git commit (7-char SHA).
+set -eu
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+# 스크립트 위치 기준 리포 루트 계산
+SCRIPT_DIR=$(cd "$(dirname "$0")" >/dev/null 2>&1 && pwd)
 REPO_ROOT="${SCRIPT_DIR}/.."
 cd "${REPO_ROOT}"
 
-VERSION="$(git rev-parse --short=7 HEAD 2>/dev/null || echo dev)"
+# 현재 커밋 7글자 SHA, git 정보가 없으면 dev
+VERSION=$(git rev-parse --short=7 HEAD 2>/dev/null || echo dev)
 
-# Default image name; can be overridden by first argument.
-# Usage:
-#   ./tools/build_server_image.sh                 # builds ghcr.io/dalbodeule/hop-gate:<hash> and :latest
-#   ./tools/build_server_image.sh my/image/name   # builds my/image/name:<hash> and :latest
-IMAGE_NAME="${1:-ghcr.io/dalbodeule/hop-gate}"
+# 기본 이미지 이름 (첫 번째 인자로 override 가능)
+# 예:
+#   ./tools/build_server_image.sh
+#   ./tools/build_server_image.sh my/image/name
+IMAGE_NAME=${1:-ghcr.io/dalbodeule/hop-gate}
 
 echo "Building hop-gate server image"
 echo "  context : ${REPO_ROOT}"
 echo "  image   : ${IMAGE_NAME}:${VERSION}"
 echo "  version : ${VERSION}"
 
-# Use docker buildx if available; fallback to docker build.
+# docker buildx 사용 가능 여부 확인
 if command -v docker >/dev/null 2>&1 && docker buildx version >/dev/null 2>&1; then
-  BUILD_CMD=(docker buildx build)
+  BUILD_CMD="docker buildx build"
 else
-  BUILD_CMD=(docker build)
+  BUILD_CMD="docker build"
 fi
 
-# Optional environment variables:
-#   PLATFORM=linux/amd64,linux/arm64   (for buildx)
-#   PUSH=1                              (for buildx --push)
+# 선택적 환경 변수:
+#   PLATFORM=linux/amd64,linux/arm64   # buildx 용
+#   PUSH=1                             # buildx --push
 
-"${BUILD_CMD[@]}" \
-  ${PLATFORM:+--platform "${PLATFORM}"} \
+PLATFORM_ARGS=""
+if [ "${PLATFORM-}" != "" ]; then
+  PLATFORM_ARGS="--platform ${PLATFORM}"
+fi
+
+PUSH_ARGS=""
+if [ "${PUSH-}" != "" ]; then
+  PUSH_ARGS="--push"
+fi
+
+# 실제 빌드 실행
+# shellcheck disable=SC2086
+${BUILD_CMD} \
+  ${PLATFORM_ARGS} \
   -f Dockerfile.server \
   --build-arg VERSION="${VERSION}" \
   -t "${IMAGE_NAME}:${VERSION}" \
   -t "${IMAGE_NAME}:latest" \
-  ${PUSH:+--push} \
+  ${PUSH_ARGS} \
   .
