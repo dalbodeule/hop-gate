@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -34,9 +35,10 @@ import (
 var version = "dev"
 
 type dtlsSessionWrapper struct {
-	sess         dtls.Session
-	mu           sync.Mutex
-	nextStreamID uint64
+	sess           dtls.Session
+	bufferedReader *bufio.Reader
+	mu             sync.Mutex
+	nextStreamID   uint64
 }
 
 func getEnvOrPanic(logger logging.Logger, key string) string {
@@ -302,7 +304,7 @@ func (w *dtlsSessionWrapper) ForwardHTTP(ctx context.Context, logger logging.Log
 
 	for {
 		var env protocol.Envelope
-		if err := codec.Decode(w.sess, &env); err != nil {
+		if err := codec.Decode(w.bufferedReader, &env); err != nil {
 			log.Error("failed to decode stream response envelope", logging.Fields{
 				"error": err.Error(),
 			})
@@ -502,7 +504,10 @@ func registerSessionForDomain(domain string, sess dtls.Session, logger logging.L
 	if d == "" {
 		return
 	}
-	w := &dtlsSessionWrapper{sess: sess}
+	w := &dtlsSessionWrapper{
+		sess:           sess,
+		bufferedReader: bufio.NewReaderSize(sess, protocol.GetDTLSReadBufferSize()),
+	}
 	sessionsMu.Lock()
 	sessionsByDomain[d] = w
 	sessionsMu.Unlock()

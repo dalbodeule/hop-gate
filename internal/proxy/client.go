@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -151,14 +152,16 @@ func (p *ClientProxy) StartLoop(ctx context.Context, sess dtls.Session) error {
 	log := p.Logger
 
 	// NOTE: pion/dtls 는 복호화된 애플리케이션 데이터를 호출자가 제공한 버퍼에 채워 넣습니다.
-	// 기본 JSON 디코더 버퍼(수백 바이트 수준)만 사용하면 큰 HTTP 바디/Envelope 에서
-	// "dtls: buffer too small" 오류가 날 수 있으므로, 여기서는 여유 있는 버퍼(64KiB)를 사용합니다. (ko)
+	// DTLS는 UDP 기반이므로 한 번의 Read()에서 전체 datagram을 읽어야 하며,
+	// pion/dtls 내부 버퍼 한계(8KB)를 초과하는 메시지는 "dtls: buffer too small" 오류를 발생시킵니다.
+	// 이를 방지하기 위해 DTLS 세션을 bufio.Reader로 감싸서 datagram을 완전히 읽어들인 후 파싱합니다. (ko)
 	// NOTE: pion/dtls decrypts application data into the buffer provided by the caller.
-	// Using only the default JSON decoder buffer (a few hundred bytes) can trigger
-	// "dtls: buffer too small" for large HTTP bodies/envelopes. The default
-	// JSON-based WireCodec internally wraps the DTLS session with a 64KiB
-	// bufio.Reader, matching this requirement. (en)
+	// Since DTLS is UDP-based, the entire datagram must be read in a single Read() call,
+	// and messages exceeding pion/dtls's internal buffer limit (8KB) will trigger
+	// "dtls: buffer too small" errors. To prevent this, we wrap the DTLS session with
+	// a bufio.Reader to fully read the datagram before parsing. (en)
 	codec := protocol.DefaultCodec
+	bufferedReader := bufio.NewReaderSize(sess, protocol.GetDTLSReadBufferSize())
 
 	for {
 		select {
@@ -171,7 +174,7 @@ func (p *ClientProxy) StartLoop(ctx context.Context, sess dtls.Session) error {
 		}
 
 		var env protocol.Envelope
-		if err := codec.Decode(sess, &env); err != nil {
+		if err := codec.Decode(bufferedReader, &env); err != nil {
 			if err == io.EOF {
 				log.Info("dtls session closed by server", nil)
 				return nil
@@ -191,7 +194,7 @@ func (p *ClientProxy) StartLoop(ctx context.Context, sess dtls.Session) error {
 				return err
 			}
 		case protocol.MessageTypeStreamOpen:
-			if err := p.handleStreamRequest(ctx, sess, &env); err != nil {
+			if err := p.handleStreamRequest(ctx, sess, bufferedReader, &env); err != nil {
 				log.Error("failed to handle stream http envelope", logging.Fields{
 					"error": err.Error(),
 				})
@@ -303,7 +306,7 @@ func (p *ClientProxy) handleHTTPEnvelope(ctx context.Context, sess dtls.Session,
 
 // handleStreamRequest 는 StreamOpen/StreamData/StreamClose 기반 HTTP 요청/응답 스트림을 처리합니다. (ko)
 // handleStreamRequest handles an HTTP request/response exchange using StreamOpen/StreamData/StreamClose frames. (en)
-func (p *ClientProxy) handleStreamRequest(ctx context.Context, sess dtls.Session, openEnv *protocol.Envelope) error {
+func (p *ClientProxy) handleStreamRequest(ctx context.Context, sess dtls.Session, reader io.Reader, openEnv *protocol.Envelope) error {
 	codec := protocol.DefaultCodec
 	log := p.Logger
 
@@ -365,7 +368,7 @@ func (p *ClientProxy) handleStreamRequest(ctx context.Context, sess dtls.Session
 
 	for {
 		var env protocol.Envelope
-		if err := codec.Decode(sess, &env); err != nil {
+		if err := codec.Decode(reader, &env); err != nil {
 			if err == io.EOF {
 				return fmt.Errorf("unexpected EOF while reading stream request body")
 			}

@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bufio"
 	"bytes"
 	"io"
 	"testing"
@@ -80,9 +81,11 @@ func TestProtobufCodecDatagramBehavior(t *testing.T) {
 		t.Fatalf("Message too short: %d bytes", len(msg))
 	}
 
-	// Decode the envelope
+	// Decode the envelope using a buffered reader (as we do in actual code)
+	// to handle datagram-based reading properly
+	reader := bufio.NewReaderSize(conn, GetDTLSReadBufferSize())
 	var decodedEnv Envelope
-	if err := codec.Decode(conn, &decodedEnv); err != nil {
+	if err := codec.Decode(reader, &decodedEnv); err != nil {
 		t.Fatalf("Failed to decode envelope: %v", err)
 	}
 
@@ -132,9 +135,10 @@ func TestProtobufCodecStreamData(t *testing.T) {
 		t.Fatalf("Expected 1 message, got %d", len(conn.messages))
 	}
 
-	// Decode
+	// Decode using a buffered reader (as we do in actual code)
+	reader := bufio.NewReaderSize(conn, GetDTLSReadBufferSize())
 	var decodedEnv Envelope
-	if err := codec.Decode(conn, &decodedEnv); err != nil {
+	if err := codec.Decode(reader, &decodedEnv); err != nil {
 		t.Fatalf("Failed to decode StreamData: %v", err)
 	}
 
@@ -208,10 +212,11 @@ func TestProtobufCodecMultipleMessages(t *testing.T) {
 		t.Fatalf("Expected %d messages, got %d", len(envelopes), len(conn.messages))
 	}
 
-	// Decode and verify all messages
+	// Decode and verify all messages using a buffered reader (as we do in actual code)
+	reader := bufio.NewReaderSize(conn, GetDTLSReadBufferSize())
 	for i := 0; i < len(envelopes); i++ {
 		var decoded Envelope
-		if err := codec.Decode(conn, &decoded); err != nil {
+		if err := codec.Decode(reader, &decoded); err != nil {
 			t.Fatalf("Failed to decode message %d: %v", i, err)
 		}
 		if decoded.Type != envelopes[i].Type {
