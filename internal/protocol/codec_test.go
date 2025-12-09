@@ -8,6 +8,7 @@ import (
 
 // mockDatagramConn simulates a datagram-based connection (like DTLS over UDP)
 // where each Write sends a separate message and each Read receives a complete message.
+// This mock verifies the FIXED behavior where the codec properly handles message boundaries.
 type mockDatagramConn struct {
 	messages [][]byte
 	readIdx  int
