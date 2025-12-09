@@ -18,6 +18,8 @@ FROM golang:1.25-alpine AS builder
 # 기본값을 지정해두면 로컬 docker build 시에도 별도 인자 없이 빌드 가능합니다.
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
+# Git 태그/커밋 정보를 main.version 에 주입하기 위한 VERSION 인자 (기본 dev)
+ARG VERSION=dev
 
 WORKDIR /src
 
@@ -32,7 +34,8 @@ RUN go mod download
 COPY . .
 
 # 서버 바이너리 빌드 (멀티 아키텍처: TARGETOS/TARGETARCH 기반)
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/hop-gate-server ./cmd/server
+# -ldflags 를 통해 main.version 에 VERSION 값을 주입합니다.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags "-X main.version=${VERSION}" -o /out/hop-gate-server ./cmd/server
 
 # ---------- Runtime stage ----------
 FROM alpine:3.20

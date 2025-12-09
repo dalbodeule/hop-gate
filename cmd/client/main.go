@@ -15,6 +15,10 @@ import (
 	"github.com/dalbodeule/hop-gate/internal/proxy"
 )
 
+// version 은 빌드 시 -ldflags "-X main.version=xxxxxxx" 로 덮어쓰이는 필드입니다.
+// 기본값 "dev" 는 로컬 개발용입니다.
+var version = "dev"
+
 func getEnvOrPanic(logger logging.Logger, key string) string {
 	value, exists := os.LookupEnv(key)
 	if !exists || strings.TrimSpace(value) == "" {
@@ -124,6 +128,7 @@ func main() {
 
 	logger.Info("hop-gate client starting", logging.Fields{
 		"stack":                 "prometheus-loki-grafana",
+		"version":               version,
 		"server_addr":           finalCfg.ServerAddr,
 		"domain":                finalCfg.Domain,
 		"local_target":          finalCfg.LocalTarget,

@@ -29,6 +29,10 @@ import (
 	"github.com/dalbodeule/hop-gate/internal/store"
 )
 
+// version 은 빌드 시 -ldflags "-X main.version=xxxxxxx" 로 덮어쓰이는 필드입니다.
+// 기본값 "dev" 는 로컬 개발용입니다.
+var version = "dev"
+
 type dtlsSessionWrapper struct {
 	sess         dtls.Session
 	mu           sync.Mutex
@@ -815,6 +819,7 @@ func main() {
 
 	logger.Info("hop-gate server starting", logging.Fields{
 		"stack":        "prometheus-loki-grafana",
+		"version":      version,
 		"http_listen":  cfg.HTTPListen,
 		"https_listen": cfg.HTTPSListen,
 		"dtls_listen":  cfg.DTLSListen,
