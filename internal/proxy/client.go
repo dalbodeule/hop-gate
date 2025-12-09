@@ -238,6 +238,30 @@ func (p *ClientProxy) StartLoop(ctx context.Context, sess dtls.Session) error {
 					"seq":       seq,
 				})
 			}
+		case protocol.MessageTypeStreamData:
+			// StreamData received at top level (not expected, should be consumed by handleStreamRequest)
+			// This can happen if frames arrive out of order or if there's a protocol mismatch
+			log.Warn("received unexpected stream_data at top level, ignoring", logging.Fields{
+				"stream_id": func() string {
+					if env.StreamData != nil {
+						return string(env.StreamData.ID)
+					}
+					return "unknown"
+				}(),
+			})
+			continue
+		case protocol.MessageTypeStreamClose:
+			// StreamClose received at top level (not expected, should be consumed by handleStreamRequest)
+			// This can happen if frames arrive out of order or if there's a protocol mismatch
+			log.Warn("received unexpected stream_close at top level, ignoring", logging.Fields{
+				"stream_id": func() string {
+					if env.StreamClose != nil {
+						return string(env.StreamClose.ID)
+					}
+					return "unknown"
+				}(),
+			})
+			continue
 		default:
 			log.Error("received unsupported envelope type from server", logging.Fields{
 				"type": env.Type,
