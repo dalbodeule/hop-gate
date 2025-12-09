@@ -34,14 +34,6 @@ import (
 // 기본값 "dev" 는 로컬 개발용입니다.
 var version = "dev"
 
-// streamResponse collects the complete response for a single HTTP stream request
-type streamResponse struct {
-	statusCode int
-	header     map[string][]string
-	body       bytes.Buffer
-	err        error
-}
-
 // pendingRequest tracks a request waiting for its response
 type pendingRequest struct {
 	streamID protocol.StreamID
@@ -211,7 +203,8 @@ func (w *dtlsSessionWrapper) readLoop() {
 					"error": err.Error(),
 				})
 			}
-			// Notify all pending requests of the error
+			// Notify all pending requests of the error by closing their response channels
+			// The doneCh will be closed by each ForwardHTTP's defer
 			w.mu.Lock()
 			for _, pending := range w.pending {
 				close(pending.respCh)
@@ -272,6 +265,12 @@ func (w *dtlsSessionWrapper) readLoop() {
 			w.logger.Warn("pending request already closed", logging.Fields{
 				"stream_id": streamID,
 			})
+		default:
+			// Channel buffer full - shouldn't happen with proper sizing
+			w.logger.Warn("response channel buffer full, dropping frame", logging.Fields{
+				"stream_id": streamID,
+				"type":      env.Type,
+			})
 		}
 	}
 }
@@ -288,10 +287,15 @@ func (w *dtlsSessionWrapper) ForwardHTTP(ctx context.Context, logger logging.Log
 	w.mu.Lock()
 	streamID := w.nextHTTPStreamID()
 	
+	// Channel buffer size for response frames to avoid blocking readLoop.
+	// A typical HTTP response has: 1 StreamOpen + N StreamData + 1 StreamClose frames.
+	// With 4KB chunks, even large responses stay within this buffer.
+	const responseChannelBuffer = 16
+
 	// Create a pending request to receive responses
 	pending := &pendingRequest{
 		streamID: streamID,
-		respCh:   make(chan *protocol.Envelope, 16), // Buffered to avoid blocking readLoop
+		respCh:   make(chan *protocol.Envelope, responseChannelBuffer),
 		doneCh:   make(chan struct{}),
 	}
 	w.pending[streamID] = pending
