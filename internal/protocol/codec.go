@@ -16,6 +16,16 @@ import (
 // This matches existing 64KiB readers used around DTLS sessions (used by the JSON codec).
 const defaultDecoderBufferSize = 64 * 1024
 
+// dtlsReadBufferSize 는 pion/dtls 내부 버퍼 한계에 맞춘 읽기 버퍼 크기입니다.
+// pion/dtls 의 UnpackDatagram 함수는 8KB (8,192 bytes) 의 기본 수신 버퍼를 사용합니다.
+// DTLS는 UDP 기반이므로 한 번의 Read()에서 전체 datagram을 읽어야 하며,
+// 이 크기를 초과하는 DTLS 레코드는 처리되지 않습니다.
+// dtlsReadBufferSize matches the pion/dtls internal buffer limit.
+// pion/dtls's UnpackDatagram function uses an 8KB (8,192 bytes) receive buffer.
+// Since DTLS is UDP-based, the entire datagram must be read in a single Read() call,
+// and DTLS records exceeding this size cannot be processed.
+const dtlsReadBufferSize = 8 * 1024 // 8KB
+
 // maxProtoEnvelopeBytes 는 단일 Protobuf Envelope 의 최대 크기에 대한 보수적 상한입니다.
 // 아직 하드 리미트로 사용하지는 않지만, 향후 방어적 체크에 사용할 수 있습니다.
 const maxProtoEnvelopeBytes = 512 * 1024 // 512KiB, 충분히 여유 있는 값
@@ -140,6 +150,14 @@ func (protobufCodec) Decode(r io.Reader, env *Envelope) error {
 // 현재는 Protobuf  length-prefix 기반 codec 을 기본으로 사용합니다.
 // 서버와 클라이언트가 모두 이 버전을 사용해야 wire-format 이 일치합니다.
 var DefaultCodec WireCodec = protobufCodec{}
+
+// GetDTLSReadBufferSize 는 DTLS 세션 읽기에 사용할 버퍼 크기를 반환합니다.
+// 이 값은 pion/dtls 내부 버퍼 한계(8KB)에 맞춰져 있습니다.
+// GetDTLSReadBufferSize returns the buffer size to use for reading from DTLS sessions.
+// This value is aligned with pion/dtls's internal buffer limit (8KB).
+func GetDTLSReadBufferSize() int {
+	return dtlsReadBufferSize
+}
 
 // toProtoEnvelope 는 내부 Envelope 구조체를 Protobuf Envelope 로 변환합니다.
 // 현재 구현은 HTTP 요청/응답 및 스트림 관련 타입(StreamOpen/StreamData/StreamClose/StreamAck)을 지원합니다.

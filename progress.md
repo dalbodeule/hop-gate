@@ -402,6 +402,110 @@ The following tasks describe concrete work items to be implemented on the `featu
     In [`internal/protocol/codec.go`](internal/protocol/codec.go:130), the `WireCodec` abstraction and Protobuf-based `DefaultCodec` allow callers to use only `protocol.DefaultCodec` while JSON remains as an auxiliary codec.
 
 ---
+ 
+##### 3.3B DTLS Session Multiplexing / 세션 내 다중 HTTP 요청 처리
+
+현재 구현은 클라이언트 측에서 단일 DTLS 세션 내에 **동시에 하나의 HTTP 요청 스트림만** 처리할 수 있습니다.
+`ClientProxy.handleStreamRequest` 가 DTLS 세션의 reader 를 직접 소비하기 때문에, 동일 세션에서 두 번째 `StreamOpen` 이 섞여 들어오면 프로토콜 위반으로 간주되고 세션이 끊어집니다.
+이 섹션은 **클라이언트 측 스트림 demux + per-stream goroutine 구조**를 도입해, 하나의 DTLS 세션 안에서 여러 HTTP 요청을 안전하게 병렬 처리하기 위한 단계입니다.
+
+Currently, the client can effectively handle **only one HTTP request stream at a time per DTLS session**.
+Because `ClientProxy.handleStreamRequest` directly consumes the DTLS session reader, an additional `StreamOpen` for a different stream interleaving on the same session is treated as a protocol error and tears down the session.
+This section introduces a **client-side stream demultiplexer + per-stream goroutines** to safely support multiple concurrent HTTP requests within a single DTLS session.
+
+---
+
+##### 3.3B.1 클라이언트 측 중앙 readLoop → 스트림 demux 설계
+##### 3.3B.1 Design client-side central readLoop → per-stream demux
+
+- [ ] `ClientProxy.StartLoop` 의 역할을 명확히 분리
+  - DTLS 세션에서 `Envelope` 를 연속해서 읽어들이는 **중앙 readLoop** 를 유지하되,
+  - 개별 스트림의 HTTP 처리 로직(현재 `handleStreamRequest` 내부 로직)을 분리해 별도 타입/구조체로 옮길 계획을 문서화합니다.
+- [ ] 스트림 demux 위한 자료구조 설계
+  - `map[protocol.StreamID]*streamReceiver` 형태의 수신측 스트림 상태 테이블을 정의합니다.
+  - 각 `streamReceiver` 는 자신만의 입력 채널(예: `inCh chan *protocol.Envelope`)을 가져, 중앙 readLoop 로부터 `StreamOpen/StreamData/StreamClose` 를 전달받도록 합니다.
+- [ ] 중앙 readLoop 에서 스트림별 라우팅 규칙 정의
+  - `Envelope.Type` 에 따라:
+    - `StreamOpen` / `StreamData` / `StreamClose`:
+      - `streamID` 를 추출하고, 해당 `streamReceiver` 의 `inCh` 로 전달.
+      - `StreamOpen` 수신 시에는 아직 없는 경우 `streamReceiver` 를 생성 후 등록.
+    - `StreamAck`:
+      - 송신 측 ARQ(`streamSender`) 용 테이블(이미 구현된 구조)을 찾아 재전송 로직으로 전달.
+  - 이 설계를 통해 중앙 readLoop 는 **DTLS 세션 → 스트림 단위 이벤트 분배**만 담당하도록 제한합니다.
+
+---
+
+##### 3.3B.2 streamReceiver 타입 설계 및 HTTP 매핑 리팩터링
+##### 3.3B.2 Design streamReceiver type and refactor HTTP mapping
+
+- [ ] `streamReceiver` 타입 정의
+  - 필드 예시:
+    - `id protocol.StreamID`
+    - 수신 ARQ 상태: `expectedSeq`, `received map[uint64][]byte`, `lost map[uint64]struct{}`
+    - 입력 채널: `inCh chan *protocol.Envelope`
+    - DTLS 세션/codec/logging 핸들: `sess dtls.Session`, `codec protocol.WireCodec`, `logger logging.Logger`
+    - 로컬 HTTP 호출 관련: `HTTPClient *http.Client`, `LocalTarget string`
+  - 역할:
+    - 서버에서 온 `StreamOpen`/`StreamData`/`StreamClose` 를 순서대로 처리해 로컬 HTTP 요청을 구성하고,
+    - 로컬 HTTP 응답을 다시 `StreamOpen`/`StreamData`/`StreamClose` 로 역방향 전송합니다.
+- [ ] 기존 `ClientProxy.handleStreamRequest` 의 로직을 `streamReceiver` 로 이전
+  - 현재 `handleStreamRequest` 안에서 수행하던 작업을 단계적으로 옮깁니다:
+    - `StreamOpen` 의 pseudo-header 에서 HTTP 메서드/URL/헤더를 복원.
+    - 요청 바디 수신용 수신 측 ARQ(`expectedSeq`, `received`, `lost`) 처리.
+    - 로컬 HTTP 요청 생성/실행 및 에러 처리.
+    - 응답을 4KiB `StreamData` chunk 로 전송 + 송신 측 ARQ(`streamSender.register`) 기록.
+  - 이때 **DTLS reader 를 직접 읽던 부분**은 제거하고, 대신 `inCh` 에서 전달된 `Envelope` 만 사용하도록 리팩터링합니다.
+- [ ] streamReceiver 생명주기 관리
+  - `StreamClose` 수신 시:
+    - 로컬 HTTP 요청 바디 구성 종료.
+    - 로컬 HTTP 요청 실행 및 응답 스트림 전송 완료 후,
+    - `streamReceivers[streamID]` 에서 자신을 제거하고 goroutine 을 종료하는 정책을 명확히 정의합니다.
+
+---
+
+##### 3.3B.3 StartLoop 와 streamReceiver 통합
+##### 3.3B.3 Integrate StartLoop and streamReceiver
+
+- [ ] `ClientProxy.StartLoop` 을 “중앙 readLoop + demux” 로 단순화
+  - `MessageTypeStreamOpen` 수신 시:
+    - `streamID := env.StreamOpen.ID` 를 기준으로 기존 `streamReceiver` 존재 여부를 검사.
+    - 없으면 새 `streamReceiver` 생성 후, goroutine 을 띄우고 `inCh <- env` 로 첫 메시지 전달.
+  - `MessageTypeStreamData` / `MessageTypeStreamClose` 수신 시:
+    - 해당 `streamReceiver` 의 `inCh` 로 그대로 전달.
+  - `MessageTypeStreamAck` 는 기존처럼 송신 측 `streamSender` 로 라우팅.
+- [ ] 에러/종료 처리 전략 정리
+  - 개별 `streamReceiver` 에서 발생하는 에러는:
+    - 로컬 HTTP 에러 → 스트림 응답에 5xx/에러 바디로 반영.
+    - 프로토콜 위반(예: 잘못된 순서의 `StreamClose`) → 해당 스트림만 정리하고 세션은 유지하는지 여부를 정의.
+  - DTLS 세션 레벨 에러(EOF, decode 실패 등)는:
+    - 모든 `streamReceiver` 의 `inCh` 를 닫고,
+    - 이후 클라이언트 전체 루프를 종료하는 방향으로 합의합니다.
+
+---
+
+##### 3.3B.4 세션 단위 직렬화 락 제거 및 멀티플렉싱 검증
+##### 3.3B.4 Remove session-level serialization lock and validate multiplexing
+
+- [ ] 서버 측 세션 직렬화 락 제거 계획 수립
+  - 현재 서버는 [`dtlsSessionWrapper`](cmd/server/main.go:111)에 `requestMu` 를 두어,
+    - 동일 DTLS 세션에서 동시에 하나의 `ForwardHTTP` 만 수행하도록 직렬화하고 있습니다.
+  - 클라이언트 측 멀티플렉싱이 안정화되면, `requestMu` 를 제거하고
+    - 하나의 세션 안에서 여러 HTTP 요청이 각기 다른 `StreamID` 로 병렬 진행되도록 허용합니다.
+- [ ] E2E 멀티플렉싱 테스트 시나리오 정의
+  - 하나의 DTLS 세션 위에서:
+    - 동시에 여러 정적 리소스(`/css`, `/js`, `/img`) 요청.
+    - 큰 응답(수 MB 파일)과 작은 응답(API JSON)이 섞여 있는 시나리오.
+  - 기대 동작:
+    - 어떤 요청이 느리더라도, 다른 요청이 세션 내부 큐잉 때문에 과도하게 지연되지 않고 병렬로 완료되는지 확인.
+    - 클라이언트/서버 로그에 프로토콜 위반(`unexpected envelope type ...`) 이 더 이상 발생하지 않는지 확인.
+- [ ] 관측성/메트릭에 멀티플렉싱 관련 라벨/필드 추가(선택)
+  - 필요 시:
+    - 세션당 동시 활성 스트림 수,
+    - 스트림 수명(요청-응답 왕복 시간),
+    - 세션 내 스트림 에러 수
+    를 관찰할 수 있는 메트릭/로그 필드를 설계합니다.
+
+---
 
 ### 3.4 ACME Integration / ACME 연동
 
