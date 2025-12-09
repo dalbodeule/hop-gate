@@ -108,33 +108,28 @@ func (protobufCodec) Encode(w io.Writer, env *Envelope) error {
 // Decode reads a length-prefixed protobuf Envelope and converts it into the internal Envelope.
 // For DTLS (UDP-based), we read the entire datagram in a single Read call.
 func (protobufCodec) Decode(r io.Reader, env *Envelope) error {
-	// DTLS는 메시지 경계가 보존되는 UDP 기반 프로토콜입니다.
-	// 한 번의 Read로 전체 데이터그램(length prefix + protobuf data)을 읽어야 합니다.
-	// DTLS is a UDP-based protocol that preserves message boundaries.
-	// We must read the entire datagram (length prefix + protobuf data) in a single Read call.
-	buf := make([]byte, maxProtoEnvelopeBytes+4)
-	n, err := r.Read(buf)
-	if err != nil {
-		return fmt.Errorf("protobuf codec: read frame: %w", err)
-	}
-	if n < 4 {
-		return fmt.Errorf("protobuf codec: frame too short: %d bytes", n)
+	// 1) 길이 prefix 4바이트를 정확히 읽는다.
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return fmt.Errorf("protobuf codec: read length prefix: %w", err)
 	}
 
-	// Extract and validate the length prefix
-	length := binary.BigEndian.Uint32(buf[:4])
+	length := binary.BigEndian.Uint32(header)
 	if length == 0 {
 		return fmt.Errorf("protobuf codec: zero-length envelope")
 	}
 	if length > maxProtoEnvelopeBytes {
 		return fmt.Errorf("protobuf codec: envelope too large: %d bytes (max %d)", length, maxProtoEnvelopeBytes)
 	}
-	if int(length) != n-4 {
-		return fmt.Errorf("protobuf codec: length mismatch: expected %d, got %d", length, n-4)
+
+	// 2) payload 를 length 바이트만큼 정확히 읽는다.
+	payload := make([]byte, int(length))
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return fmt.Errorf("protobuf codec: read payload: %w", err)
 	}
 
 	var pbEnv protocolpb.Envelope
-	if err := proto.Unmarshal(buf[4:n], &pbEnv); err != nil {
+	if err := proto.Unmarshal(payload, &pbEnv); err != nil {
 		return fmt.Errorf("protobuf codec: unmarshal envelope: %w", err)
 	}
 
