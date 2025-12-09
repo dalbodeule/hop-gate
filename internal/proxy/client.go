@@ -241,25 +241,23 @@ func (p *ClientProxy) StartLoop(ctx context.Context, sess dtls.Session) error {
 		case protocol.MessageTypeStreamData:
 			// StreamData received at top level (not expected, should be consumed by handleStreamRequest)
 			// This can happen if frames arrive out of order or if there's a protocol mismatch
+			streamID := "unknown"
+			if env.StreamData != nil {
+				streamID = string(env.StreamData.ID)
+			}
 			log.Warn("received unexpected stream_data at top level, ignoring", logging.Fields{
-				"stream_id": func() string {
-					if env.StreamData != nil {
-						return string(env.StreamData.ID)
-					}
-					return "unknown"
-				}(),
+				"stream_id": streamID,
 			})
 			continue
 		case protocol.MessageTypeStreamClose:
 			// StreamClose received at top level (not expected, should be consumed by handleStreamRequest)
 			// This can happen if frames arrive out of order or if there's a protocol mismatch
+			streamID := "unknown"
+			if env.StreamClose != nil {
+				streamID = string(env.StreamClose.ID)
+			}
 			log.Warn("received unexpected stream_close at top level, ignoring", logging.Fields{
-				"stream_id": func() string {
-					if env.StreamClose != nil {
-						return string(env.StreamClose.ID)
-					}
-					return "unknown"
-				}(),
+				"stream_id": streamID,
 			})
 			continue
 		default:
