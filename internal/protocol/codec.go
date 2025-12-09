@@ -46,8 +46,8 @@ func (jsonCodec) Decode(r io.Reader, env *Envelope) error {
 	return dec.Decode(env)
 }
 
-// protobufCodec 은 Protobuf + length-prefix framing 기반 WireCodec 구현입니다.
-// 한 Envelope 당 [4바이트 big-endian 길이] + [protobuf bytes] 형태로 인코딩합니다.
+// protobufCodec 은 Protobuf  length-prefix framing 기반 WireCodec 구현입니다.
+// 한 Envelope 당 [4바이트 big-endian 길이]  [protobuf bytes] 형태로 인코딩합니다.
 type protobufCodec struct{}
 
 // Encode 는 Envelope 를 Protobuf Envelope 로 변환한 뒤, length-prefix 프레이밍으로 기록합니다.
@@ -102,8 +102,22 @@ func (protobufCodec) Encode(w io.Writer, env *Envelope) error {
 // 내부 Envelope 구조체로 변환합니다.
 // Decode reads a length-prefixed protobuf Envelope and converts it into the internal Envelope.
 func (protobufCodec) Decode(r io.Reader, env *Envelope) error {
+	// IMPORTANT:
+	// pion/dtls 는 복호화된 애플리케이션 데이터를 호출자가 제공한 버퍼에 한 번에 채웁니다.
+	// 너무 작은 버퍼(예: 4바이트 len prefix)로 직접 Read 를 호출하면
+	// "dtls: buffer is too small" (temporary) 에러가 발생할 수 있습니다.
+	//
+	// 이를 피하기 위해, DTLS 세션 위에서는 항상 충분히 큰 bufio.Reader 로 래핑한 뒤
+	// io.ReadFull 을 사용합니다. 이렇게 하면 하위 DTLS Conn.Read 는
+	// 내부 버퍼 크기(defaultDecoderBufferSize, 64KiB)만큼 읽고,
+	// 그 위에서 length-prefix 를 안전하게 처리할 수 있습니다.
+	br, ok := r.(*bufio.Reader)
+	if !ok {
+		br = bufio.NewReaderSize(r, defaultDecoderBufferSize)
+	}
+
 	var lenBuf [4]byte
-	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+	if _, err := io.ReadFull(br, lenBuf[:]); err != nil {
 		return fmt.Errorf("protobuf codec: read length prefix: %w", err)
 	}
 	n := binary.BigEndian.Uint32(lenBuf[:])
@@ -115,7 +129,7 @@ func (protobufCodec) Decode(r io.Reader, env *Envelope) error {
 	}
 
 	buf := make([]byte, int(n))
-	if _, err := io.ReadFull(r, buf); err != nil {
+	if _, err := io.ReadFull(br, buf); err != nil {
 		return fmt.Errorf("protobuf codec: read payload: %w", err)
 	}
 
@@ -128,7 +142,8 @@ func (protobufCodec) Decode(r io.Reader, env *Envelope) error {
 }
 
 // DefaultCodec 은 현재 런타임에서 사용하는 기본 WireCodec 입니다.
-// 이제 Protobuf 기반 codec 을 기본으로 사용합니다.
+// 현재는 Protobuf  length-prefix 기반 codec 을 기본으로 사용합니다.
+// 서버와 클라이언트가 모두 이 버전을 사용해야 wire-format 이 일치합니다.
 var DefaultCodec WireCodec = protobufCodec{}
 
 // toProtoEnvelope 는 내부 Envelope 구조체를 Protobuf Envelope 로 변환합니다.
