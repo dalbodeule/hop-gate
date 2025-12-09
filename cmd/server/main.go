@@ -124,6 +124,13 @@ type dtlsSessionWrapper struct {
 	// streamSenders keeps ARQ sender state for HTTP request bodies sent
 	// from server to client. (en)
 	streamSenders map[protocol.StreamID]*streamSender
+
+	// requestMu 는 이 DTLS 세션에서 동시에 처리될 수 있는 HTTP 요청을
+	// 하나로 제한하기 위한 뮤텍스입니다. (ko)
+	// requestMu serializes HTTP requests on this DTLS session so that the
+	// client (which currently processes one StreamOpen at a time) does not
+	// see interleaved streams. (en)
+	requestMu sync.Mutex
 }
 
 // registerStreamSender 는 주어진 스트림 ID 에 대한 송신 측 ARQ 상태를 등록합니다. (ko)
@@ -438,6 +445,14 @@ func (w *dtlsSessionWrapper) ForwardHTTP(ctx context.Context, logger logging.Log
 	if ctx == nil {
 		ctx = context.Background()
 	}
+
+	// 현재 클라이언트 구현은 DTLS 세션당 하나의 StreamOpen/StreamData/StreamClose
+	// 만 순차적으로 처리하므로, 서버에서도 동일 세션 위 HTTP 요청을 직렬화합니다. (ko)
+	// The current client processes exactly one StreamOpen/StreamData/StreamClose
+	// sequence at a time per DTLS session, so we serialize HTTP requests on
+	// this session as well. (en)
+	w.requestMu.Lock()
+	defer w.requestMu.Unlock()
 
 	// Generate a unique stream ID (needs mutex for nextStreamID)
 	w.mu.Lock()
