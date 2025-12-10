@@ -418,13 +418,13 @@ This section introduces a **client-side stream demultiplexer + per-stream gorout
 ##### 3.3B.1 클라이언트 측 중앙 readLoop → 스트림 demux 설계
 ##### 3.3B.1 Design client-side central readLoop → per-stream demux
 
-- [ ] `ClientProxy.StartLoop` 의 역할을 명확히 분리
+- [x] `ClientProxy.StartLoop` 의 역할을 명확히 분리
   - DTLS 세션에서 `Envelope` 를 연속해서 읽어들이는 **중앙 readLoop** 를 유지하되,
   - 개별 스트림의 HTTP 처리 로직(현재 `handleStreamRequest` 내부 로직)을 분리해 별도 타입/구조체로 옮길 계획을 문서화합니다.
-- [ ] 스트림 demux 위한 자료구조 설계
+- [x] 스트림 demux 위한 자료구조 설계
   - `map[protocol.StreamID]*streamReceiver` 형태의 수신측 스트림 상태 테이블을 정의합니다.
   - 각 `streamReceiver` 는 자신만의 입력 채널(예: `inCh chan *protocol.Envelope`)을 가져, 중앙 readLoop 로부터 `StreamOpen/StreamData/StreamClose` 를 전달받도록 합니다.
-- [ ] 중앙 readLoop 에서 스트림별 라우팅 규칙 정의
+- [x] 중앙 readLoop 에서 스트림별 라우팅 규칙 정의
   - `Envelope.Type` 에 따라:
     - `StreamOpen` / `StreamData` / `StreamClose`:
       - `streamID` 를 추출하고, 해당 `streamReceiver` 의 `inCh` 로 전달.
@@ -438,7 +438,7 @@ This section introduces a **client-side stream demultiplexer + per-stream gorout
 ##### 3.3B.2 streamReceiver 타입 설계 및 HTTP 매핑 리팩터링
 ##### 3.3B.2 Design streamReceiver type and refactor HTTP mapping
 
-- [ ] `streamReceiver` 타입 정의
+- [x] `streamReceiver` 타입 정의
   - 필드 예시:
     - `id protocol.StreamID`
     - 수신 ARQ 상태: `expectedSeq`, `received map[uint64][]byte`, `lost map[uint64]struct{}`
@@ -448,14 +448,14 @@ This section introduces a **client-side stream demultiplexer + per-stream gorout
   - 역할:
     - 서버에서 온 `StreamOpen`/`StreamData`/`StreamClose` 를 순서대로 처리해 로컬 HTTP 요청을 구성하고,
     - 로컬 HTTP 응답을 다시 `StreamOpen`/`StreamData`/`StreamClose` 로 역방향 전송합니다.
-- [ ] 기존 `ClientProxy.handleStreamRequest` 의 로직을 `streamReceiver` 로 이전
+- [x] 기존 `ClientProxy.handleStreamRequest` 의 로직을 `streamReceiver` 로 이전
   - 현재 `handleStreamRequest` 안에서 수행하던 작업을 단계적으로 옮깁니다:
     - `StreamOpen` 의 pseudo-header 에서 HTTP 메서드/URL/헤더를 복원.
     - 요청 바디 수신용 수신 측 ARQ(`expectedSeq`, `received`, `lost`) 처리.
     - 로컬 HTTP 요청 생성/실행 및 에러 처리.
     - 응답을 4KiB `StreamData` chunk 로 전송 + 송신 측 ARQ(`streamSender.register`) 기록.
   - 이때 **DTLS reader 를 직접 읽던 부분**은 제거하고, 대신 `inCh` 에서 전달된 `Envelope` 만 사용하도록 리팩터링합니다.
-- [ ] streamReceiver 생명주기 관리
+- [x] streamReceiver 생명주기 관리
   - `StreamClose` 수신 시:
     - 로컬 HTTP 요청 바디 구성 종료.
     - 로컬 HTTP 요청 실행 및 응답 스트림 전송 완료 후,
@@ -466,14 +466,14 @@ This section introduces a **client-side stream demultiplexer + per-stream gorout
 ##### 3.3B.3 StartLoop 와 streamReceiver 통합
 ##### 3.3B.3 Integrate StartLoop and streamReceiver
 
-- [ ] `ClientProxy.StartLoop` 을 “중앙 readLoop + demux” 로 단순화
+- [x] `ClientProxy.StartLoop` 을 “중앙 readLoop + demux” 로 단순화
   - `MessageTypeStreamOpen` 수신 시:
     - `streamID := env.StreamOpen.ID` 를 기준으로 기존 `streamReceiver` 존재 여부를 검사.
     - 없으면 새 `streamReceiver` 생성 후, goroutine 을 띄우고 `inCh <- env` 로 첫 메시지 전달.
   - `MessageTypeStreamData` / `MessageTypeStreamClose` 수신 시:
     - 해당 `streamReceiver` 의 `inCh` 로 그대로 전달.
   - `MessageTypeStreamAck` 는 기존처럼 송신 측 `streamSender` 로 라우팅.
-- [ ] 에러/종료 처리 전략 정리
+- [x] 에러/종료 처리 전략 정리
   - 개별 `streamReceiver` 에서 발생하는 에러는:
     - 로컬 HTTP 에러 → 스트림 응답에 5xx/에러 바디로 반영.
     - 프로토콜 위반(예: 잘못된 순서의 `StreamClose`) → 해당 스트림만 정리하고 세션은 유지하는지 여부를 정의.
@@ -486,7 +486,7 @@ This section introduces a **client-side stream demultiplexer + per-stream gorout
 ##### 3.3B.4 세션 단위 직렬화 락 제거 및 멀티플렉싱 검증
 ##### 3.3B.4 Remove session-level serialization lock and validate multiplexing
 
-- [ ] 서버 측 세션 직렬화 락 제거 계획 수립
+- [x] 서버 측 세션 직렬화 락 제거 계획 수립
   - 현재 서버는 [`dtlsSessionWrapper`](cmd/server/main.go:111)에 `requestMu` 를 두어,
     - 동일 DTLS 세션에서 동시에 하나의 `ForwardHTTP` 만 수행하도록 직렬화하고 있습니다.
   - 클라이언트 측 멀티플렉싱이 안정화되면, `requestMu` 를 제거하고

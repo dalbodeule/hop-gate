@@ -124,13 +124,6 @@ type dtlsSessionWrapper struct {
 	// streamSenders keeps ARQ sender state for HTTP request bodies sent
 	// from server to client. (en)
 	streamSenders map[protocol.StreamID]*streamSender
-
-	// requestMu 는 이 DTLS 세션에서 동시에 처리될 수 있는 HTTP 요청을
-	// 하나로 제한하기 위한 뮤텍스입니다. (ko)
-	// requestMu serializes HTTP requests on this DTLS session so that the
-	// client (which currently processes one StreamOpen at a time) does not
-	// see interleaved streams. (en)
-	requestMu sync.Mutex
 }
 
 // registerStreamSender 는 주어진 스트림 ID 에 대한 송신 측 ARQ 상태를 등록합니다. (ko)
@@ -446,13 +439,17 @@ func (w *dtlsSessionWrapper) ForwardHTTP(ctx context.Context, logger logging.Log
 		ctx = context.Background()
 	}
 
-	// 현재 클라이언트 구현은 DTLS 세션당 하나의 StreamOpen/StreamData/StreamClose
-	// 만 순차적으로 처리하므로, 서버에서도 동일 세션 위 HTTP 요청을 직렬화합니다. (ko)
-	// The current client processes exactly one StreamOpen/StreamData/StreamClose
-	// sequence at a time per DTLS session, so we serialize HTTP requests on
-	// this session as well. (en)
-	w.requestMu.Lock()
-	defer w.requestMu.Unlock()
+	// 클라이언트는 단일 DTLS 세션 내에서 다중 HTTP 스트림을 처리할 수 있도록
+	// 중앙 readLoop + per-stream demux 구조(3.3B.1~3.3B.2)가 적용되어 있습니다. (ko)
+	// With the client-side central read loop + per-stream demux (3.3B.1–3.3B.2),
+	// a single DTLS session can now handle multiple concurrent HTTP streams. (en)
+	//
+	// 3.3B.4에서 정의한 것처럼, 서버 측에서는 더 이상 세션 단위 직렬화 락을 사용하지 않고
+	// 동일 DTLS 세션 위에서 여러 ForwardHTTP 호출이 서로 다른 StreamID 로 병렬 진행되도록
+	// 허용합니다. (ko)
+	// As per 3.3B.4, we no longer use a session-level serialization lock here and
+	// allow multiple ForwardHTTP calls to run concurrently on the same DTLS session
+	// using distinct StreamIDs. (en)
 
 	// Generate a unique stream ID (needs mutex for nextStreamID)
 	w.mu.Lock()
