@@ -243,7 +243,7 @@ HopGate 의 최종 목표는 **TCP + TLS(HTTPS) + HTTP/2 + gRPC** 기반 터널�
     로컬 HTTP 서비스(예: `127.0.0.1:8080`)로 proxy 하고, 응답을 다시 `TunnelFrame` 시퀀스로 전송합니다.
   - 기존 `internal/proxy/client.go` 의 HTTP 매핑/스트림 ARQ 경험을, gRPC 메시지 단위 chunk/flow-control 설계에 참고합니다.
 
-- [ ] HTTP ↔ gRPC 터널 매핑 규약 정의
+- [x] HTTP ↔ gRPC 터널 매핑 규약 정의
   - 한 HTTP 요청/응답 쌍을 gRPC 스트림 상에서 어떻게 표현할지 스키마를 정의합니다:
     - 요청: `StreamID`, method, URL, headers, body chunks
     - 응답: `StreamID`, status, headers, body chunks, error
