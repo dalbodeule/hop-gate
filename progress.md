@@ -229,7 +229,7 @@ This document tracks implementation progress against the HopGate architecture an
 HopGate 의 최종 목표는 **TCP + TLS(HTTPS) + HTTP/2 + gRPC** 기반 터널로 HTTP 트래픽을 전달하는 것입니다.
 이 섹션에서는 DTLS 기반 초기 설계를 정리만 남기고, 실제 구현/남은 작업은 gRPC 터널 기준으로 재정의합니다.
 
-- [ ] 서버 측 gRPC 터널 엔드포인트 설계/구현
+- [x] 서버 측 gRPC 터널 엔드포인트 설계/구현
   - 외부 사용자용 HTTPS(443/TCP)와 같은 포트에서:
     - 일반 HTTP 요청(브라우저/REST)은 기존 리버스 프록시 경로로,
     - `Content-Type: application/grpc` 인 요청은 클라이언트 터널용 gRPC 서버로
@@ -237,13 +237,13 @@ HopGate 의 최종 목표는 **TCP + TLS(HTTPS) + HTTP/2 + gRPC** 기반 터널�
   - 예시: `rpc OpenTunnel(stream TunnelFrame) returns (stream TunnelFrame)` (bi-directional streaming).
   - HTTP/2 + ALPN(h2)을 사용해 gRPC 스트림을 유지하고, 요청/응답 HTTP 메시지를 `TunnelFrame`으로 멀티플렉싱합니다.
 
-- [ ] 클라이언트 측 gRPC 터널 설계/구현
+- [x] 클라이언트 측 gRPC 터널 설계/구현
   - 클라이언트 프로세스는 HopGate 서버로 장기 유지 bi-di gRPC 스트림을 **하나(또는 소수 개)** 연 상태로 유지합니다.
   - 서버로부터 들어오는 `TunnelFrame`(요청 메타데이터 + 바디 chunk)을 수신해,
     로컬 HTTP 서비스(예: `127.0.0.1:8080`)로 proxy 하고, 응답을 다시 `TunnelFrame` 시퀀스로 전송합니다.
   - 기존 `internal/proxy/client.go` 의 HTTP 매핑/스트림 ARQ 경험을, gRPC 메시지 단위 chunk/flow-control 설계에 참고합니다.
 
-- [ ] HTTP ↔ gRPC 터널 매핑 규약 정의
+- [x] HTTP ↔ gRPC 터널 매핑 규약 정의
   - 한 HTTP 요청/응답 쌍을 gRPC 스트림 상에서 어떻게 표현할지 스키마를 정의합니다:
     - 요청: `StreamID`, method, URL, headers, body chunks
     - 응답: `StreamID`, status, headers, body chunks, error

@@ -718,7 +718,7 @@ const file_internal_protocol_hopgate_stream_proto_rawDesc = "" +
 	"\fstream_close\x18\x05 \x01(\v2 .hopgate.protocol.v1.StreamCloseH\x00R\vstreamClose\x12?\n" +
 	"\n" +
 	"stream_ack\x18\x06 \x01(\v2\x1e.hopgate.protocol.v1.StreamAckH\x00R\tstreamAckB\t\n" +
-	"\apayloadB@Z>github.com/dalbodeule/hop-gate/internal/protocol/pb;protocolpbb\x06proto3"
+	"\apayloadB\x19Z\x17internal/protocol/pb;pbb\x06proto3"
 
 var (
 	file_internal_protocol_hopgate_stream_proto_rawDescOnce sync.Once
