@@ -18,7 +18,9 @@ BIN_DIR := ./bin
 SERVER_BIN := $(BIN_DIR)/hop-gate-server
 CLIENT_BIN := $(BIN_DIR)/hop-gate-client
 
-VERSION ?= $(shell git describe --tags --dirty --always 2>/dev/null || echo dev)
+# VERSION 은 현재 커밋의 7글자 SHA 를 사용합니다 (예: 1a2b3c4).
+# git 정보가 없으면 dev 로 fallback 합니다.
+VERSION ?= $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo dev)
 
 # .env 파일 로드
 include .env

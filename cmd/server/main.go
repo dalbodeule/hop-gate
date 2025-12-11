@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -11,12 +12,17 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 
 	"github.com/dalbodeule/hop-gate/internal/acme"
 	"github.com/dalbodeule/hop-gate/internal/admin"
@@ -26,13 +32,139 @@ import (
 	"github.com/dalbodeule/hop-gate/internal/logging"
 	"github.com/dalbodeule/hop-gate/internal/observability"
 	"github.com/dalbodeule/hop-gate/internal/protocol"
+	protocolpb "github.com/dalbodeule/hop-gate/internal/protocol/pb"
 	"github.com/dalbodeule/hop-gate/internal/store"
 )
 
+// version 은 빌드 시 -ldflags "-X main.version=xxxxxxx" 로 덮어쓰이는 필드입니다.
+// 기본값 "dev" 는 로컬 개발용입니다.
+var version = "dev"
+
+// pendingRequest tracks a request waiting for its response
+type pendingRequest struct {
+	streamID protocol.StreamID
+	respCh   chan *protocol.Envelope
+	doneCh   chan struct{}
+}
+
+// streamSender 는 특정 스트림에 대해 전송한 StreamData 프레임의 payload 를
+// 시퀀스 번호별로 보관하여, peer 로부터의 StreamAck 를 기반으로 선택적 재전송을
+// 수행하기 위한 송신 측 ARQ 상태를 나타냅니다. (ko)
+// streamSender keeps outstanding StreamData payloads per sequence number so that
+// they can be selectively retransmitted based on StreamAck from the peer. (en)
+type streamSender struct {
+	mu          sync.Mutex
+	outstanding map[uint64][]byte
+}
+
+func newStreamSender() *streamSender {
+	return &streamSender{
+		outstanding: make(map[uint64][]byte),
+	}
+}
+
+func (s *streamSender) register(seq uint64, data []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.outstanding == nil {
+		s.outstanding = make(map[uint64][]byte)
+	}
+	buf := make([]byte, len(data))
+	copy(buf, data)
+	s.outstanding[seq] = buf
+}
+
+// handleAck 는 주어진 StreamAck 를 적용하여 AckSeq 이하의 프레임을 정리하고,
+// LostSeqs 중 아직 outstanding 에 남아 있는 시퀀스의 payload 를 복사하여
+// 재전송 대상 목록으로 반환합니다. (ko)
+// handleAck applies the given StreamAck, removes frames up to AckSeq, and
+// returns copies of payloads for LostSeqs that are still outstanding so that
+// they can be retransmitted. (en)
+func (s *streamSender) handleAck(ack *protocol.StreamAck) map[uint64][]byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.outstanding == nil {
+		return nil
+	}
+
+	// 연속 수신 완료 구간(seq <= AckSeq)은 outstanding 에서 제거합니다.
+	for seq := range s.outstanding {
+		if seq <= ack.AckSeq {
+			delete(s.outstanding, seq)
+		}
+	}
+
+	// LostSeqs 가 비어 있으면 재전송할 것이 없습니다.
+	if len(ack.LostSeqs) == 0 {
+		return nil
+	}
+
+	// LostSeqs 중 아직 outstanding 에 남아 있는 것만 재전송 대상으로 선택합니다.
+	lost := make(map[uint64][]byte, len(ack.LostSeqs))
+	for _, seq := range ack.LostSeqs {
+		if data, ok := s.outstanding[seq]; ok {
+			buf := make([]byte, len(data))
+			copy(buf, data)
+			lost[seq] = buf
+		}
+	}
+	return lost
+}
+
 type dtlsSessionWrapper struct {
-	sess         dtls.Session
+	sess           dtls.Session
+	bufferedReader *bufio.Reader
+	codec          protocol.WireCodec
+	logger         logging.Logger
+
 	mu           sync.Mutex
 	nextStreamID uint64
+	pending      map[protocol.StreamID]*pendingRequest
+	readerDone   chan struct{}
+
+	// streamSenders 는 서버 → 클라이언트 방향 HTTP 요청 바디 전송에 대한
+	// 송신 측 ARQ 상태를 보관합니다. (ko)
+	// streamSenders keeps ARQ sender state for HTTP request bodies sent
+	// from server to client. (en)
+	streamSenders map[protocol.StreamID]*streamSender
+}
+
+// registerStreamSender 는 주어진 스트림 ID 에 대한 송신 측 ARQ 상태를 등록합니다. (ko)
+// registerStreamSender registers the sender-side ARQ state for a given stream ID. (en)
+func (w *dtlsSessionWrapper) registerStreamSender(id protocol.StreamID, sender *streamSender) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.streamSenders == nil {
+		w.streamSenders = make(map[protocol.StreamID]*streamSender)
+	}
+	w.streamSenders[id] = sender
+}
+
+// unregisterStreamSender 는 더 이상 사용하지 않는 스트림 ID 에 대한 송신 측 ARQ 상태를 제거합니다. (ko)
+// unregisterStreamSender removes the sender-side ARQ state for a stream ID that is no longer used. (en)
+func (w *dtlsSessionWrapper) unregisterStreamSender(id protocol.StreamID) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.streamSenders == nil {
+		return
+	}
+	delete(w.streamSenders, id)
+}
+
+// getStreamSender 는 주어진 스트림 ID 에 대한 송신 측 ARQ 상태를 반환합니다. (ko)
+// getStreamSender returns the sender-side ARQ state for the given stream ID, if any. (en)
+func (w *dtlsSessionWrapper) getStreamSender(id protocol.StreamID) *streamSender {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.streamSenders == nil {
+		return nil
+	}
+	return w.streamSenders[id]
 }
 
 func getEnvOrPanic(logger logging.Logger, key string) string {
@@ -170,21 +302,191 @@ func parseExpectedIPsFromEnv(logger logging.Logger, envKey string) []net.IP {
 
 // ForwardHTTP 는 HTTP 요청을 DTLS 세션 위의 StreamOpen/StreamData/StreamClose 프레임으로 전송하고,
 // 역방향 스트림 응답을 수신해 protocol.Response 로 반환합니다. (ko)
+// readLoop continuously reads from the DTLS session and dispatches incoming frames
+// to the appropriate pending request based on stream ID. It also handles
+// application-level ARQ (StreamAck) for request bodies sent from server to client. (en)
+func (w *dtlsSessionWrapper) readLoop() {
+	defer close(w.readerDone)
+
+	for {
+		var env protocol.Envelope
+		if err := w.codec.Decode(w.bufferedReader, &env); err != nil {
+			if err == io.EOF {
+				w.logger.Info("dtls session closed", nil)
+			} else {
+				w.logger.Error("failed to decode envelope in read loop", logging.Fields{
+					"error": err.Error(),
+				})
+			}
+			// Notify all pending requests of the error by closing their response channels.
+			// The doneCh will be closed by each ForwardHTTP's defer.
+			w.mu.Lock()
+			for _, pending := range w.pending {
+				close(pending.respCh)
+			}
+			w.pending = make(map[protocol.StreamID]*pendingRequest)
+			w.mu.Unlock()
+			return
+		}
+
+		// 1) StreamAck 처리: 서버 → 클라이언트 방향 요청 바디 전송에 대한 ARQ. (ko)
+		// 1) Handle StreamAck: application-level ARQ for request bodies
+		//    sent from server to client. (en)
+		if env.Type == protocol.MessageTypeStreamAck {
+			sa := env.StreamAck
+			if sa == nil {
+				w.logger.Warn("received stream_ack envelope with nil payload", logging.Fields{})
+				continue
+			}
+			streamID := sa.ID
+			sender := w.getStreamSender(streamID)
+			if sender == nil {
+				w.logger.Warn("received stream_ack for unknown stream ID", logging.Fields{
+					"stream_id": streamID,
+				})
+				continue
+			}
+			lost := sender.handleAck(sa)
+			for seq, data := range lost {
+				retryEnv := protocol.Envelope{
+					Type: protocol.MessageTypeStreamData,
+					StreamData: &protocol.StreamData{
+						ID:   streamID,
+						Seq:  seq,
+						Data: data,
+					},
+				}
+				if err := w.codec.Encode(w.sess, &retryEnv); err != nil {
+					w.logger.Error("failed to retransmit stream_data after stream_ack", logging.Fields{
+						"stream_id": streamID,
+						"seq":       seq,
+						"error":     err.Error(),
+					})
+					// 세션 쓰기 오류가 발생하면 루프를 종료하여 상위에서 세션 종료를 유도합니다. (ko)
+					// On write error, stop the loop so that the caller can tear down the session. (en)
+					return
+				}
+			}
+			// StreamAck 는 애플리케이션 페이로드를 포함하지 않으므로 pending 에 전달하지 않습니다. (ko)
+			// StreamAck carries no application payload, so it is not forwarded to pending requests. (en)
+			continue
+		}
+
+		// 2) StreamOpen / StreamData / StreamClose 에 대해 stream ID 를 산출하고,
+		//    해당 pending 요청으로 전달합니다. (ko)
+		// 2) For StreamOpen / StreamData / StreamClose, determine the stream ID
+		//    and forward to the corresponding pending request. (en)
+		var streamID protocol.StreamID
+		switch env.Type {
+		case protocol.MessageTypeStreamOpen:
+			if env.StreamOpen != nil {
+				streamID = env.StreamOpen.ID
+			}
+		case protocol.MessageTypeStreamData:
+			if env.StreamData != nil {
+				streamID = env.StreamData.ID
+			}
+		case protocol.MessageTypeStreamClose:
+			if env.StreamClose != nil {
+				streamID = env.StreamClose.ID
+			}
+		default:
+			w.logger.Warn("received unexpected envelope type in read loop", logging.Fields{
+				"type": env.Type,
+			})
+			continue
+		}
+
+		if streamID == "" {
+			w.logger.Warn("received envelope with empty stream ID", logging.Fields{
+				"type": env.Type,
+			})
+			continue
+		}
+
+		// Find the pending request for this stream ID
+		w.mu.Lock()
+		pending := w.pending[streamID]
+		w.mu.Unlock()
+
+		if pending == nil {
+			w.logger.Warn("received envelope for unknown stream ID", logging.Fields{
+				"stream_id": streamID,
+				"type":      env.Type,
+			})
+			continue
+		}
+
+		// Send the envelope to the waiting request
+		select {
+		case pending.respCh <- &env:
+			// Successfully delivered
+		case <-pending.doneCh:
+			// Request was cancelled or timed out
+			w.logger.Warn("pending request already closed", logging.Fields{
+				"stream_id": streamID,
+			})
+		default:
+			// Channel buffer full - shouldn't happen with proper sizing
+			w.logger.Warn("response channel buffer full, dropping frame", logging.Fields{
+				"stream_id": streamID,
+				"type":      env.Type,
+			})
+		}
+	}
+}
+
 // ForwardHTTP forwards an HTTP request over the DTLS session using StreamOpen/StreamData/StreamClose
 // frames and reconstructs the reverse stream into a protocol.Response. (en)
+// This method now supports concurrent requests by using a channel-based multiplexing approach.
 func (w *dtlsSessionWrapper) ForwardHTTP(ctx context.Context, logger logging.Logger, req *http.Request, serviceName string) (*protocol.Response, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	codec := protocol.DefaultCodec
+	// 클라이언트는 단일 DTLS 세션 내에서 다중 HTTP 스트림을 처리할 수 있도록
+	// 중앙 readLoop + per-stream demux 구조(3.3B.1~3.3B.2)가 적용되어 있습니다. (ko)
+	// With the client-side central read loop + per-stream demux (3.3B.1–3.3B.2),
+	// a single DTLS session can now handle multiple concurrent HTTP streams. (en)
+	//
+	// 3.3B.4에서 정의한 것처럼, 서버 측에서는 더 이상 세션 단위 직렬화 락을 사용하지 않고
+	// 동일 DTLS 세션 위에서 여러 ForwardHTTP 호출이 서로 다른 StreamID 로 병렬 진행되도록
+	// 허용합니다. (ko)
+	// As per 3.3B.4, we no longer use a session-level serialization lock here and
+	// allow multiple ForwardHTTP calls to run concurrently on the same DTLS session
+	// using distinct StreamIDs. (en)
 
-	// 세션 내에서 고유한 StreamID 를 생성합니다. (ko)
-	// Generate a unique StreamID for this HTTP request within the DTLS session. (en)
+	// Generate a unique stream ID (needs mutex for nextStreamID)
+	w.mu.Lock()
 	streamID := w.nextHTTPStreamID()
+
+	// Channel buffer size for response frames to avoid blocking readLoop.
+	// A typical HTTP response has: 1 StreamOpen + N StreamData + 1 StreamClose frames.
+	// With 4KB chunks, even large responses stay within this buffer.
+	const responseChannelBuffer = 16
+
+	// Create a pending request to receive responses
+	pending := &pendingRequest{
+		streamID: streamID,
+		respCh:   make(chan *protocol.Envelope, responseChannelBuffer),
+		doneCh:   make(chan struct{}),
+	}
+	w.pending[streamID] = pending
+	w.mu.Unlock()
+
+	// 서버 → 클라이언트 방향 요청 바디 전송에 대한 송신 측 ARQ 상태를 준비합니다. (ko)
+	// Prepare ARQ sender state for the request body sent from server to client. (en)
+	sender := newStreamSender()
+	w.registerStreamSender(streamID, sender)
+
+	// Ensure cleanup on exit
+	defer func() {
+		w.mu.Lock()
+		delete(w.pending, streamID)
+		w.mu.Unlock()
+		close(pending.doneCh)
+		w.unregisterStreamSender(streamID)
+	}()
 
 	log := logger.With(logging.Fields{
 		"component":  "http_to_dtls",
@@ -227,7 +529,7 @@ func (w *dtlsSessionWrapper) ForwardHTTP(ctx context.Context, logger logging.Log
 			Header:     hdr,
 		},
 	}
-	if err := codec.Encode(w.sess, openEnv); err != nil {
+	if err := w.codec.Encode(w.sess, openEnv); err != nil {
 		log.Error("failed to encode stream_open envelope", logging.Fields{
 			"error": err.Error(),
 		})
@@ -243,6 +545,10 @@ func (w *dtlsSessionWrapper) ForwardHTTP(ctx context.Context, logger logging.Log
 			n, err := req.Body.Read(buf)
 			if n > 0 {
 				dataCopy := append([]byte(nil), buf[:n]...)
+				// 송신 측 ARQ: Seq 별 payload 를 기록해 두었다가, 클라이언트의 StreamAck 를 기반으로 재전송합니다. (ko)
+				// Sender-side ARQ: record payload per Seq so it can be retransmitted based on StreamAck from the client. (en)
+				sender.register(seq, dataCopy)
+
 				dataEnv := &protocol.Envelope{
 					Type: protocol.MessageTypeStreamData,
 					StreamData: &protocol.StreamData{
@@ -251,7 +557,7 @@ func (w *dtlsSessionWrapper) ForwardHTTP(ctx context.Context, logger logging.Log
 						Data: dataCopy,
 					},
 				}
-				if err2 := codec.Encode(w.sess, dataEnv); err2 != nil {
+				if err2 := w.codec.Encode(w.sess, dataEnv); err2 != nil {
 					log.Error("failed to encode stream_data envelope", logging.Fields{
 						"error": err2.Error(),
 					})
@@ -277,7 +583,7 @@ func (w *dtlsSessionWrapper) ForwardHTTP(ctx context.Context, logger logging.Log
 			Error: "",
 		},
 	}
-	if err := codec.Encode(w.sess, closeReqEnv); err != nil {
+	if err := w.codec.Encode(w.sess, closeReqEnv); err != nil {
 		log.Error("failed to encode request stream_close envelope", logging.Fields{
 			"error": err.Error(),
 		})
@@ -285,91 +591,184 @@ func (w *dtlsSessionWrapper) ForwardHTTP(ctx context.Context, logger logging.Log
 	}
 
 	// 클라이언트로부터 역방향 스트림 응답을 수신합니다. (ko)
-	// Receive reverse stream response (StreamOpen + StreamData* + StreamClose). (en)
+	// Receive reverse stream response (StreamOpen + StreamData* + StreamClose) via the readLoop. (en)
 	var (
 		resp       protocol.Response
 		bodyBuf    bytes.Buffer
 		gotOpen    bool
 		statusCode = http.StatusOK
+
+		// 응답 바디(클라이언트 → 서버)에 대한 수신 측 ARQ 상태입니다. (ko)
+		// ARQ receiver state for the response body (client → server). (en)
+		expectedSeq uint64
+		received    = make(map[uint64][]byte)
+		lost        = make(map[uint64]struct{})
 	)
+	const maxLostReport = 32
 
 	resp.RequestID = string(streamID)
 	resp.Header = make(map[string][]string)
 
 	for {
-		var env protocol.Envelope
-		if err := codec.Decode(w.sess, &env); err != nil {
-			log.Error("failed to decode stream response envelope", logging.Fields{
-				"error": err.Error(),
+		select {
+		case <-ctx.Done():
+			log.Error("context cancelled while waiting for response", logging.Fields{
+				"error": ctx.Err().Error(),
 			})
-			return nil, err
-		}
+			return nil, ctx.Err()
 
-		switch env.Type {
-		case protocol.MessageTypeStreamOpen:
-			so := env.StreamOpen
-			if so == nil {
-				return nil, fmt.Errorf("stream_open response payload is nil")
+		case <-w.readerDone:
+			log.Error("dtls session closed while waiting for response", nil)
+			return nil, fmt.Errorf("dtls session closed")
+
+		case env, ok := <-pending.respCh:
+			if !ok {
+				// Channel closed, session is dead
+				log.Error("response channel closed unexpectedly", nil)
+				return nil, fmt.Errorf("response channel closed")
 			}
-			if so.ID != streamID {
-				return nil, fmt.Errorf("unexpected stream_open for id %q (expected %q)", so.ID, streamID)
-			}
-			// 상태 코드 및 헤더 복원 (pseudo-header 제거). (ko)
-			// Restore status code and headers (strip pseudo-headers). (en)
-			statusStr := firstHeaderValue(so.Header, protocol.HeaderKeyStatus, strconv.Itoa(http.StatusOK))
-			if sc, err := strconv.Atoi(statusStr); err == nil && sc > 0 {
-				statusCode = sc
-			}
-			for k, vs := range so.Header {
-				if k == protocol.HeaderKeyMethod ||
-					k == protocol.HeaderKeyURL ||
-					k == protocol.HeaderKeyHost ||
-					k == protocol.HeaderKeyStatus {
-					continue
+
+			switch env.Type {
+			case protocol.MessageTypeStreamOpen:
+				so := env.StreamOpen
+				if so == nil {
+					return nil, fmt.Errorf("stream_open response payload is nil")
 				}
-				resp.Header[k] = append([]string(nil), vs...)
-			}
-			gotOpen = true
-
-		case protocol.MessageTypeStreamData:
-			sd := env.StreamData
-			if sd == nil {
-				return nil, fmt.Errorf("stream_data response payload is nil")
-			}
-			if sd.ID != streamID {
-				return nil, fmt.Errorf("unexpected stream_data for id %q (expected %q)", sd.ID, streamID)
-			}
-			if len(sd.Data) > 0 {
-				if _, err := bodyBuf.Write(sd.Data); err != nil {
-					return nil, fmt.Errorf("buffer stream_data response: %w", err)
+				// 상태 코드 및 헤더 복원 (pseudo-header 제거). (ko)
+				// Restore status code and headers (strip pseudo-headers). (en)
+				statusStr := firstHeaderValue(so.Header, protocol.HeaderKeyStatus, strconv.Itoa(http.StatusOK))
+				if sc, err := strconv.Atoi(statusStr); err == nil && sc > 0 {
+					statusCode = sc
 				}
-			}
+				for k, vs := range so.Header {
+					if k == protocol.HeaderKeyMethod ||
+						k == protocol.HeaderKeyURL ||
+						k == protocol.HeaderKeyHost ||
+						k == protocol.HeaderKeyStatus {
+						continue
+					}
+					resp.Header[k] = append([]string(nil), vs...)
+				}
+				gotOpen = true
 
-		case protocol.MessageTypeStreamClose:
-			sc := env.StreamClose
-			if sc == nil {
-				return nil, fmt.Errorf("stream_close response payload is nil")
-			}
-			if sc.ID != streamID {
-				return nil, fmt.Errorf("unexpected stream_close for id %q (expected %q)", sc.ID, streamID)
-			}
-			// 스트림 종료: 지금까지 수신한 헤더/바디로 protocol.Response 를 완성합니다. (ko)
-			// Stream finished: complete protocol.Response using collected headers/body. (en)
-			resp.Status = statusCode
-			resp.Body = bodyBuf.Bytes()
-			resp.Error = sc.Error
+			case protocol.MessageTypeStreamData:
+				sd := env.StreamData
+				if sd == nil {
+					return nil, fmt.Errorf("stream_data response payload is nil")
+				}
 
-			log.Info("received stream http response over dtls", logging.Fields{
-				"status": resp.Status,
-				"error":  resp.Error,
-			})
-			if !gotOpen {
-				return nil, fmt.Errorf("received stream_close without prior stream_open for stream %q", streamID)
-			}
-			return &resp, nil
+				// 수신 측 ARQ: Seq 에 따라 분기하고, 연속 구간을 bodyBuf 에 순서대로 기록합니다. (ko)
+				// Receiver-side ARQ: handle Seq and append contiguous data to bodyBuf in order. (en)
+				switch {
+				case sd.Seq == expectedSeq:
+					if len(sd.Data) > 0 {
+						if _, err := bodyBuf.Write(sd.Data); err != nil {
+							return nil, fmt.Errorf("buffer stream_data response: %w", err)
+						}
+					}
+					expectedSeq++
+					for {
+						data, ok := received[expectedSeq]
+						if !ok {
+							break
+						}
+						if len(data) > 0 {
+							if _, err := bodyBuf.Write(data); err != nil {
+								return nil, fmt.Errorf("buffer reordered stream_data response: %w", err)
+							}
+						}
+						delete(received, expectedSeq)
+						delete(lost, expectedSeq)
+						expectedSeq++
+					}
 
-		default:
-			return nil, fmt.Errorf("unexpected envelope type %q in stream response", env.Type)
+					// AckSeq 이전 구간의 lost 항목 정리
+					for seq := range lost {
+						if seq < expectedSeq {
+							delete(lost, seq)
+						}
+					}
+
+				case sd.Seq > expectedSeq:
+					// 앞선 일부 Seq 들이 누락된 상태: 현재 프레임을 버퍼링하고 missing seq 들을 lost 에 추가. (ko)
+					// Missing earlier Seq: buffer this frame and mark missing seqs as lost. (en)
+					if len(sd.Data) > 0 {
+						bufCopy := make([]byte, len(sd.Data))
+						copy(bufCopy, sd.Data)
+						received[sd.Seq] = bufCopy
+					}
+					for seq := expectedSeq; seq < sd.Seq && len(lost) < maxLostReport; seq++ {
+						if _, ok := lost[seq]; !ok {
+							lost[seq] = struct{}{}
+						}
+					}
+
+				default:
+					// sd.Seq < expectedSeq 인 경우: 이미 처리했거나 Ack 로 커버된 프레임 → 무시. (ko)
+					// sd.Seq < expectedSeq: already processed/acked frame → ignore. (en)
+				}
+
+				// 수신 측 StreamAck 전송:
+				//   - AckSeq: 0부터 시작해 연속으로 수신 완료한 마지막 시퀀스 (expectedSeq-1)
+				//   - LostSeqs: 현재 윈도우 내에서 누락된 시퀀스 중 상한 개수(maxLostReport)까지만 포함 (ko)
+				// Send receiver-side StreamAck:
+				//   - AckSeq: last contiguously received sequence starting from 0 (expectedSeq-1)
+				//   - LostSeqs: up to maxLostReport missing sequences in the current window. (en)
+				var ackSeq uint64
+				if expectedSeq == 0 {
+					ackSeq = 0
+				} else {
+					ackSeq = expectedSeq - 1
+				}
+
+				lostSeqs := make([]uint64, 0, len(lost))
+				for seq := range lost {
+					if seq >= expectedSeq {
+						lostSeqs = append(lostSeqs, seq)
+					}
+				}
+				if len(lostSeqs) > 0 {
+					sort.Slice(lostSeqs, func(i, j int) bool { return lostSeqs[i] < lostSeqs[j] })
+					if len(lostSeqs) > maxLostReport {
+						lostSeqs = lostSeqs[:maxLostReport]
+					}
+				}
+
+				ackEnv := protocol.Envelope{
+					Type: protocol.MessageTypeStreamAck,
+					StreamAck: &protocol.StreamAck{
+						ID:       streamID,
+						AckSeq:   ackSeq,
+						LostSeqs: lostSeqs,
+					},
+				}
+				if err := w.codec.Encode(w.sess, &ackEnv); err != nil {
+					return nil, fmt.Errorf("send stream ack: %w", err)
+				}
+
+			case protocol.MessageTypeStreamClose:
+				sc := env.StreamClose
+				if sc == nil {
+					return nil, fmt.Errorf("stream_close response payload is nil")
+				}
+				// 스트림 종료: 지금까지 수신한 헤더/바디로 protocol.Response 를 완성합니다. (ko)
+				// Stream finished: complete protocol.Response using collected headers/body. (en)
+				resp.Status = statusCode
+				resp.Body = bodyBuf.Bytes()
+				resp.Error = sc.Error
+
+				log.Info("received stream http response over dtls", logging.Fields{
+					"status": resp.Status,
+					"error":  resp.Error,
+				})
+				if !gotOpen {
+					return nil, fmt.Errorf("received stream_close without prior stream_open for stream %q", streamID)
+				}
+				return &resp, nil
+
+			default:
+				return nil, fmt.Errorf("unexpected envelope type %q in stream response", env.Type)
+			}
 		}
 	}
 }
@@ -396,11 +795,441 @@ func firstHeaderValue(hdr map[string][]string, key, def string) string {
 	return def
 }
 
+// firstHeaderValueFromPB 는 map[string]*HeaderValues 형태의 헤더에서 첫 번째 값을 반환하고,
+// 값이 없으면 기본값을 반환합니다. (ko)
+// firstHeaderValueFromPB returns the first value for a header key in
+// map[string]*protocolpb.HeaderValues, or the provided default if the key is
+// missing or empty. (en)
+func firstHeaderValueFromPB(hdr map[string]*protocolpb.HeaderValues, key, def string) string {
+	if hdr == nil {
+		return def
+	}
+	if hv, ok := hdr[key]; ok && hv != nil && len(hv.Values) > 0 {
+		return hv.Values[0]
+	}
+	return def
+}
+
+// newGRPCTunnelSession 는 단일 OpenTunnel bi-di 스트림에 대한 gRPC 터널 세션을 생성합니다. (ko)
+// newGRPCTunnelSession constructs a grpcTunnelSession for a single OpenTunnel
+// bi-directional stream. (en)
+func newGRPCTunnelSession(stream protocolpb.HopGateTunnel_OpenTunnelServer, logger logging.Logger) *grpcTunnelSession {
+	if logger == nil {
+		logger = logging.NewStdJSONLogger("grpc_tunnel_session")
+	}
+	return &grpcTunnelSession{
+		stream:     stream,
+		logger:     logger,
+		pending:    make(map[string]*grpcPendingRequest),
+		readerDone: make(chan struct{}),
+	}
+}
+
+func (t *grpcTunnelSession) send(env *protocolpb.Envelope) error {
+	t.sendMu.Lock()
+	defer t.sendMu.Unlock()
+	return t.stream.Send(env)
+}
+
+func (t *grpcTunnelSession) nextHTTPStreamID() string {
+	t.mu.Lock()
+	id := t.nextStreamID
+	t.nextStreamID++
+	t.mu.Unlock()
+	return fmt.Sprintf("http-%d", id)
+}
+
+// recvLoop 는 OpenTunnel gRPC 스트림에서 Envelope 를 지속적으로 읽어
+// HTTP 요청별 pending 테이블로 전달합니다. (ko)
+// recvLoop continuously reads Envelope messages from the OpenTunnel gRPC stream
+// and dispatches them to per-request pending tables. (en)
+func (t *grpcTunnelSession) recvLoop() error {
+	defer close(t.readerDone)
+
+	for {
+		env, err := t.stream.Recv()
+		if err != nil {
+			if err == io.EOF {
+				t.logger.Info("grpc tunnel session closed by client", nil)
+				return nil
+			}
+			t.logger.Error("grpc tunnel receive error", logging.Fields{
+				"error": err.Error(),
+			})
+			return err
+		}
+
+		var streamID string
+		switch payload := env.Payload.(type) {
+		case *protocolpb.Envelope_StreamOpen:
+			if payload.StreamOpen != nil {
+				streamID = payload.StreamOpen.Id
+			}
+		case *protocolpb.Envelope_StreamData:
+			if payload.StreamData != nil {
+				streamID = payload.StreamData.Id
+			}
+		case *protocolpb.Envelope_StreamClose:
+			if payload.StreamClose != nil {
+				streamID = payload.StreamClose.Id
+			}
+		case *protocolpb.Envelope_StreamAck:
+			// StreamAck 는 gRPC 터널에서는 사용하지 않습니다. HTTP/2 가 신뢰성/순서를 보장합니다. (ko)
+			// StreamAck is currently unused for gRPC tunnels; HTTP/2 already
+			// guarantees reliable, ordered delivery. (en)
+			continue
+		default:
+			t.logger.Warn("received unsupported envelope payload on grpc tunnel session", logging.Fields{
+				"payload_type": fmt.Sprintf("%T", env.Payload),
+			})
+			continue
+		}
+
+		if streamID == "" {
+			t.logger.Warn("received envelope with empty stream id on grpc tunnel session", logging.Fields{})
+			continue
+		}
+
+		t.mu.Lock()
+		pending := t.pending[streamID]
+		t.mu.Unlock()
+
+		if pending == nil {
+			t.logger.Warn("received envelope for unknown stream id on grpc tunnel session", logging.Fields{
+				"stream_id": streamID,
+			})
+			continue
+		}
+
+		select {
+		case pending.respCh <- env:
+		case <-pending.doneCh:
+			t.logger.Warn("pending grpc tunnel request already closed", logging.Fields{
+				"stream_id": streamID,
+			})
+		default:
+			t.logger.Warn("grpc tunnel response channel buffer full, dropping frame", logging.Fields{
+				"stream_id": streamID,
+			})
+		}
+	}
+}
+
+// ForwardHTTP 는 HTTP 요청을 gRPC 터널 위의 StreamOpen/StreamData/StreamClose 프레임으로 전송하고,
+// 역방향 스트림 응답을 수신해 protocol.Response 로 반환합니다. (ko)
+// ForwardHTTP forwards an HTTP request over the gRPC tunnel using
+// StreamOpen/StreamData/StreamClose frames and reconstructs the reverse
+// stream into a protocol.Response. (en)
+func (t *grpcTunnelSession) ForwardHTTP(ctx context.Context, logger logging.Logger, req *http.Request, serviceName string) (*protocol.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// Generate a unique stream ID for this HTTP request.
+	streamID := t.nextHTTPStreamID()
+
+	// Channel buffer size for response frames to avoid blocking recvLoop.
+	const responseChannelBuffer = 16
+
+	pending := &grpcPendingRequest{
+		streamID: streamID,
+		respCh:   make(chan *protocolpb.Envelope, responseChannelBuffer),
+		doneCh:   make(chan struct{}),
+	}
+
+	t.mu.Lock()
+	if t.pending == nil {
+		t.pending = make(map[string]*grpcPendingRequest)
+	}
+	t.pending[streamID] = pending
+	t.mu.Unlock()
+
+	// Ensure cleanup on exit.
+	defer func() {
+		t.mu.Lock()
+		delete(t.pending, streamID)
+		t.mu.Unlock()
+		close(pending.doneCh)
+	}()
+
+	log := logger.With(logging.Fields{
+		"component":  "http_to_tunnel",
+		"request_id": streamID,
+		"method":     req.Method,
+		"url":        req.URL.String(),
+	})
+
+	log.Info("forwarding http request over grpc tunnel", logging.Fields{
+		"host":   req.Host,
+		"scheme": req.URL.Scheme,
+	})
+
+	// Build request headers and pseudo-headers.
+	hdr := make(map[string]*protocolpb.HeaderValues, len(req.Header)+3)
+	addHeaderValues := func(key string, values []string) {
+		if len(values) == 0 {
+			return
+		}
+		hv, ok := hdr[key]
+		if !ok || hv == nil {
+			hv = &protocolpb.HeaderValues{}
+			hdr[key] = hv
+		}
+		hv.Values = append(hv.Values, values...)
+	}
+
+	for k, vs := range req.Header {
+		addHeaderValues(k, vs)
+	}
+	addHeaderValues(protocol.HeaderKeyMethod, []string{req.Method})
+	if req.URL != nil {
+		addHeaderValues(protocol.HeaderKeyURL, []string{req.URL.String()})
+	}
+	host := req.Host
+	if host == "" && req.URL != nil {
+		host = req.URL.Host
+	}
+	if host != "" {
+		addHeaderValues(protocol.HeaderKeyHost, []string{host})
+	}
+
+	// Send StreamOpen specifying the logical service and headers.
+	open := &protocolpb.StreamOpen{
+		Id:          streamID,
+		ServiceName: serviceName,
+		TargetAddr:  "",
+		Header:      hdr,
+	}
+	openEnv := &protocolpb.Envelope{
+		Payload: &protocolpb.Envelope_StreamOpen{StreamOpen: open},
+	}
+	if err := t.send(openEnv); err != nil {
+		log.Error("failed to send stream_open on grpc tunnel", logging.Fields{
+			"error": err.Error(),
+		})
+		return nil, err
+	}
+
+	// Send request body as StreamData frames.
+	var seq uint64
+	if req.Body != nil {
+		buf := make([]byte, protocol.StreamChunkSize)
+		for {
+			n, err := req.Body.Read(buf)
+			if n > 0 {
+				dataCopy := append([]byte(nil), buf[:n]...)
+				dataEnv := &protocolpb.Envelope{
+					Payload: &protocolpb.Envelope_StreamData{
+						StreamData: &protocolpb.StreamData{
+							Id:   streamID,
+							Seq:  seq,
+							Data: dataCopy,
+						},
+					},
+				}
+				if err2 := t.send(dataEnv); err2 != nil {
+					log.Error("failed to send stream_data on grpc tunnel", logging.Fields{
+						"error": err2.Error(),
+					})
+					return nil, err2
+				}
+				seq++
+			}
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return nil, fmt.Errorf("read http request body for streaming: %w", err)
+			}
+		}
+	}
+
+	// Send StreamClose to mark the end of the request body.
+	closeEnv := &protocolpb.Envelope{
+		Payload: &protocolpb.Envelope_StreamClose{
+			StreamClose: &protocolpb.StreamClose{
+				Id:    streamID,
+				Error: "",
+			},
+		},
+	}
+	if err := t.send(closeEnv); err != nil {
+		log.Error("failed to send request stream_close on grpc tunnel", logging.Fields{
+			"error": err.Error(),
+		})
+		return nil, err
+	}
+
+	// Receive reverse stream response (StreamOpen + StreamData* + StreamClose).
+	var (
+		resp       protocol.Response
+		bodyBuf    bytes.Buffer
+		gotOpen    bool
+		statusCode = http.StatusOK
+	)
+
+	resp.RequestID = streamID
+	resp.Header = make(map[string][]string)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Error("context cancelled while waiting for response", logging.Fields{
+				"error": ctx.Err().Error(),
+			})
+			return nil, ctx.Err()
+
+		case <-t.readerDone:
+			log.Error("grpc tunnel closed while waiting for response", nil)
+			return nil, fmt.Errorf("grpc tunnel closed")
+
+		case env, ok := <-pending.respCh:
+			if !ok {
+				log.Error("grpc tunnel response channel closed unexpectedly", nil)
+				return nil, fmt.Errorf("grpc tunnel response channel closed")
+			}
+
+			switch payload := env.Payload.(type) {
+			case *protocolpb.Envelope_StreamOpen:
+				so := payload.StreamOpen
+				if so == nil {
+					return nil, fmt.Errorf("stream_open response payload is nil")
+				}
+				statusStr := firstHeaderValueFromPB(so.Header, protocol.HeaderKeyStatus, strconv.Itoa(http.StatusOK))
+				if sc, err := strconv.Atoi(statusStr); err == nil && sc > 0 {
+					statusCode = sc
+				}
+				for k, hv := range so.Header {
+					if k == protocol.HeaderKeyMethod ||
+						k == protocol.HeaderKeyURL ||
+						k == protocol.HeaderKeyHost ||
+						k == protocol.HeaderKeyStatus {
+						continue
+					}
+					if hv == nil || len(hv.Values) == 0 {
+						continue
+					}
+					resp.Header[k] = append([]string(nil), hv.Values...)
+				}
+				gotOpen = true
+
+			case *protocolpb.Envelope_StreamData:
+				sd := payload.StreamData
+				if sd == nil {
+					return nil, fmt.Errorf("stream_data response payload is nil")
+				}
+				if len(sd.Data) > 0 {
+					if _, err := bodyBuf.Write(sd.Data); err != nil {
+						return nil, fmt.Errorf("buffer stream_data response: %w", err)
+					}
+				}
+
+			case *protocolpb.Envelope_StreamClose:
+				sc := payload.StreamClose
+				if sc == nil {
+					return nil, fmt.Errorf("stream_close response payload is nil")
+				}
+				// Complete the protocol.Response using collected headers/body. (en)
+				resp.Status = statusCode
+				resp.Body = bodyBuf.Bytes()
+				resp.Error = sc.Error
+
+				log.Info("received stream http response over grpc tunnel", logging.Fields{
+					"status": resp.Status,
+					"error":  resp.Error,
+				})
+				if !gotOpen {
+					return nil, fmt.Errorf("received stream_close without prior stream_open for stream %q", streamID)
+				}
+				return &resp, nil
+
+			default:
+				return nil, fmt.Errorf("unexpected envelope payload type %T in stream response", env.Payload)
+			}
+		}
+	}
+}
+
 var (
 	sessionsMu       sync.RWMutex
 	sessionsByDomain = make(map[string]*dtlsSessionWrapper)
 )
 
+// grpcPendingRequest tracks a single HTTP request waiting for its response on a gRPC tunnel. (en)
+type grpcPendingRequest struct {
+	streamID string
+	respCh   chan *protocolpb.Envelope
+	doneCh   chan struct{}
+}
+
+// grpcTunnelSession represents a single long-lived gRPC tunnel (OpenTunnel stream)
+// that can multiplex multiple HTTP requests by StreamID. (en)
+type grpcTunnelSession struct {
+	stream protocolpb.HopGateTunnel_OpenTunnelServer
+	logger logging.Logger
+
+	mu           sync.Mutex
+	nextStreamID uint64
+	pending      map[string]*grpcPendingRequest
+
+	readerDone chan struct{}
+
+	sendMu sync.Mutex
+}
+
+var (
+	tunnelsMu       sync.RWMutex
+	tunnelsByDomain = make(map[string]*grpcTunnelSession)
+)
+
+func registerTunnelForDomain(domain string, sess *grpcTunnelSession, logger logging.Logger) string {
+	d := strings.ToLower(strings.TrimSpace(domain))
+	if d == "" || sess == nil {
+		return ""
+	}
+	tunnelsMu.Lock()
+	tunnelsByDomain[d] = sess
+	tunnelsMu.Unlock()
+
+	logger.Info("registered grpc tunnel for domain", logging.Fields{
+		"domain": d,
+	})
+	return d
+}
+
+func unregisterTunnelForDomain(domain string, sess *grpcTunnelSession, logger logging.Logger) {
+	d := strings.ToLower(strings.TrimSpace(domain))
+	if d == "" || sess == nil {
+		return
+	}
+	tunnelsMu.Lock()
+	cur := tunnelsByDomain[d]
+	if cur == sess {
+		delete(tunnelsByDomain, d)
+	}
+	tunnelsMu.Unlock()
+
+	logger.Info("unregistered grpc tunnel for domain", logging.Fields{
+		"domain": d,
+	})
+}
+
+func getTunnelForHost(host string) *grpcTunnelSession {
+	h := host
+	if i := strings.Index(h, ":"); i != -1 {
+		h = h[:i]
+	}
+	h = strings.ToLower(strings.TrimSpace(h))
+	if h == "" {
+		return nil
+	}
+	tunnelsMu.RLock()
+	defer tunnelsMu.RUnlock()
+	return tunnelsByDomain[h]
+}
+
+// statusRecorder 는 HTTP 응답 상태 코드를 캡처하기 위한 래퍼입니다.
+// Prometheus 메트릭에서 status 라벨을 기록하는 데 사용합니다.
 // statusRecorder 는 HTTP 응답 상태 코드를 캡처하기 위한 래퍼입니다.
 // Prometheus 메트릭에서 status 라벨을 기록하는 데 사용합니다.
 type statusRecorder struct {
@@ -411,6 +1240,118 @@ type statusRecorder struct {
 func (w *statusRecorder) WriteHeader(code int) {
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
+}
+
+// grpcTunnelServer 는 HopGate gRPC 터널 서비스(HopGateTunnel)의 서버 구현체입니다. (ko)
+// grpcTunnelServer implements the HopGateTunnel gRPC service on the server side. (en)
+type grpcTunnelServer struct {
+	protocolpb.UnimplementedHopGateTunnelServer
+
+	logger    logging.Logger
+	validator dtls.DomainValidator
+}
+
+// newGRPCTunnelServer 는 gRPC 터널 서버 구현체를 생성합니다. (ko)
+// newGRPCTunnelServer constructs a new gRPC tunnel server implementation. (en)
+func newGRPCTunnelServer(logger logging.Logger, validator dtls.DomainValidator) *grpcTunnelServer {
+	baseLogger := logger
+	if baseLogger == nil {
+		baseLogger = logging.NewStdJSONLogger("grpc_tunnel")
+	}
+	return &grpcTunnelServer{
+		logger: baseLogger.With(logging.Fields{
+			"component": "grpc_tunnel",
+		}),
+		validator: validator,
+	}
+}
+
+// OpenTunnel 은 클라이언트와 서버 간 장기 유지 bi-directional gRPC 스트림을 처리합니다. (ko)
+// OpenTunnel handles the long-lived bi-directional gRPC stream between the
+// server and a HopGate client. It performs an initial control-stream
+// handshake (domain/API key validation), registers the tunnel for the
+// authenticated domain, and runs a central receive loop for HTTP streams. (en)
+func (s *grpcTunnelServer) OpenTunnel(stream protocolpb.HopGateTunnel_OpenTunnelServer) error {
+	ctx := stream.Context()
+
+	// 원격 주소가 있으면 로그 필드에 추가합니다. (ko)
+	// Attach remote address from the peer info to log fields when available. (en)
+	fields := logging.Fields{}
+	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
+		fields["remote_addr"] = p.Addr.String()
+	}
+
+	log := s.logger.With(fields)
+	log.Info("grpc tunnel opened", nil)
+	defer log.Info("grpc tunnel closed", nil)
+
+	// 1) 초기 control StreamOpen(id="control-0") 을 수신하여 핸드셰이크를 수행합니다. (ko)
+	// 1) Receive initial control StreamOpen (id="control-0") and perform handshake. (en)
+	env, err := stream.Recv()
+	if err != nil {
+		if err == io.EOF {
+			log.Warn("grpc tunnel closed before sending control stream_open", nil)
+			return status.Error(codes.InvalidArgument, "missing initial control stream_open")
+		}
+		log.Error("failed to receive initial control stream_open", logging.Fields{
+			"error": err.Error(),
+		})
+		return err
+	}
+
+	soPayload, ok := env.Payload.(*protocolpb.Envelope_StreamOpen)
+	if !ok || soPayload.StreamOpen == nil {
+		log.Error("first envelope on grpc tunnel is not stream_open", logging.Fields{
+			"payload_type": fmt.Sprintf("%T", env.Payload),
+		})
+		return status.Error(codes.InvalidArgument, "first envelope on tunnel must be control stream_open")
+	}
+
+	control := soPayload.StreamOpen
+	controlID := strings.TrimSpace(control.Id)
+
+	headers := control.Header
+	domain := firstHeaderValueFromPB(headers, "X-HopGate-Domain", "")
+	apiKey := firstHeaderValueFromPB(headers, "X-HopGate-API-Key", "")
+	localTarget := firstHeaderValueFromPB(headers, "X-HopGate-Local-Target", "")
+
+	if domain == "" || apiKey == "" {
+		log.Warn("grpc tunnel control stream missing domain or api key", logging.Fields{
+			"control_id": controlID,
+		})
+		return status.Error(codes.Unauthenticated, "missing domain or api key on control stream_open")
+	}
+
+	// Validate (domain, api_key) using the shared domain validator.
+	if s.validator != nil {
+		if err := s.validator.ValidateDomainAPIKey(ctx, domain, apiKey); err != nil {
+			log.Warn("grpc tunnel domain/api_key validation failed", logging.Fields{
+				"domain": domain,
+				"error":  err.Error(),
+			})
+			return status.Error(codes.PermissionDenied, "invalid domain or api key")
+		}
+	}
+
+	log.Info("grpc tunnel handshake succeeded", logging.Fields{
+		"domain":       domain,
+		"local_target": localTarget,
+		"control_id":   controlID,
+	})
+
+	// Register this tunnel session for the authenticated domain.
+	sessionLogger := s.logger.With(logging.Fields{
+		"domain": domain,
+	})
+	tunnel := newGRPCTunnelSession(stream, sessionLogger)
+	normalizedDomain := registerTunnelForDomain(domain, tunnel, s.logger)
+	defer unregisterTunnelForDomain(normalizedDomain, tunnel, s.logger)
+
+	// 2) 이후 수신되는 StreamOpen/StreamData/StreamClose 는 grpcTunnelSession.recvLoop 에서
+	//    HTTP 요청별로 demux 됩니다. (ko)
+	// 2) Subsequent StreamOpen/StreamData/StreamClose frames are demultiplexed per
+	//    HTTP request by grpcTunnelSession.recvLoop. (en)
+	return tunnel.recvLoop()
 }
 
 // hopGateOwnedHeaders 는 HopGate 서버가 스스로 관리하는 응답 헤더 목록입니다. (ko)
@@ -493,12 +1434,41 @@ func hostDomainHandler(allowedDomain string, logger logging.Logger, next http.Ha
 	})
 }
 
+// grpcOrHTTPHandler 는 단일 HTTPS 포트에서 gRPC(OpenTunnel)와 일반 HTTP 요청을
+// Content-Type 및 프로토콜(HTTP/2) 기준으로 라우팅하는 헬퍼입니다. (ko)
+// grpcOrHTTPHandler routes between gRPC (OpenTunnel) and regular HTTP handlers
+// on a single HTTPS port, based on Content-Type and protocol (HTTP/2). (en)
+func grpcOrHTTPHandler(grpcServer *grpc.Server, httpHandler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+		// gRPC 요청은 HTTP/2 + Content-Type: application/grpc 조합으로 들어옵니다. (ko)
+		// gRPC requests arrive as HTTP/2 with Content-Type: application/grpc. (en)
+		if r.ProtoMajor == 2 && strings.Contains(r.Header.Get("Content-Type"), "application/grpc") {
+			grpcServer.ServeHTTP(w, r)
+			return
+		}
+		httpHandler.ServeHTTP(w, r)
+	})
+}
+
 func registerSessionForDomain(domain string, sess dtls.Session, logger logging.Logger) {
 	d := strings.ToLower(strings.TrimSpace(domain))
 	if d == "" {
 		return
 	}
-	w := &dtlsSessionWrapper{sess: sess}
+	w := &dtlsSessionWrapper{
+		sess:           sess,
+		bufferedReader: bufio.NewReaderSize(sess, protocol.GetDTLSReadBufferSize()),
+		codec:          protocol.DefaultCodec,
+		logger:         logger.With(logging.Fields{"component": "dtls_session_wrapper", "domain": d}),
+		pending:        make(map[protocol.StreamID]*pendingRequest),
+		readerDone:     make(chan struct{}),
+		streamSenders:  make(map[protocol.StreamID]*streamSender),
+	}
+
+	// Start background reader goroutine to demultiplex incoming responses
+	go w.readLoop()
+
 	sessionsMu.Lock()
 	sessionsByDomain[d] = w
 	sessionsMu.Unlock()
@@ -625,8 +1595,10 @@ func newHTTPHandler(logger logging.Logger, proxyTimeout time.Duration) http.Hand
 			return
 		}
 
-		// 2. 일반 HTTP 요청은 DTLS 를 통해 클라이언트로 포워딩
-		// 간단한 서비스 이름 결정: 우선 "web" 고정, 추후 Router 도입 시 개선.
+		// 2. 일반 HTTP 요청은 활성 gRPC 터널을 통해 클라이언트로 포워딩합니다. (ko)
+		// 2. Regular HTTP requests are forwarded to clients over active gRPC tunnels. (en)
+		// 간단한 서비스 이름 결정: 우선 "web" 고정, 추후 Router 도입 시 개선. (ko)
+		// For now, use a fixed logical service name "web"; this can be improved with a Router later. (en)
 		serviceName := "web"
 
 		// Host 헤더에서 포트를 제거하고 소문자로 정규화합니다.
@@ -649,14 +1621,14 @@ func newHTTPHandler(logger logging.Logger, proxyTimeout time.Duration) http.Hand
 			return
 		}
 
-		sessWrapper := getSessionForHost(hostLower)
-		if sessWrapper == nil {
-			log.Warn("no dtls session for host", logging.Fields{
+		tunnel := getTunnelForHost(hostLower)
+		if tunnel == nil {
+			log.Warn("no tunnel for host", logging.Fields{
 				"host": r.Host,
 			})
-			observability.ProxyErrorsTotal.WithLabelValues("no_dtls_session").Inc()
-			// 등록되지 않았거나 활성 세션이 없는 도메인으로의 요청은 404 로 응답합니다. (ko)
-			// Requests for hosts without an active DTLS session return 404. (en)
+			observability.ProxyErrorsTotal.WithLabelValues("no_tunnel_session").Inc()
+			// 등록되지 않았거나 활성 터널이 없는 도메인으로의 요청은 404 로 응답합니다. (ko)
+			// Requests for hosts without an active tunnel return 404. (en)
 			writeErrorPage(sr, r, http.StatusNotFound)
 			return
 		}
@@ -684,14 +1656,15 @@ func newHTTPHandler(logger logging.Logger, proxyTimeout time.Duration) http.Hand
 			}
 		}
 
-		// r.Body 는 ForwardHTTP 내에서 읽고 닫지 않으므로 여기서 닫기
+		// r.Body 는 ForwardHTTP 내에서 읽고 닫지 않으므로 여기서 닫기 (ko)
+		// r.Body is consumed inside ForwardHTTP; ensure it is closed here. (en)
 		defer r.Body.Close()
 
-		// 서버 측에서 DTLS → 클라이언트 → 로컬 서비스까지의 전체 왕복 시간을 제한하기 위해
+		// 서버 측에서 gRPC 터널 → 클라이언트 → 로컬 서비스까지의 전체 왕복 시간을 제한하기 위해
 		// 요청 컨텍스트에 타임아웃을 적용합니다. 기본값은 15초이며,
 		// HOP_SERVER_PROXY_TIMEOUT_SECONDS 로 재정의할 수 있습니다. (ko)
 		// Apply an overall timeout (default 15s, configurable via
-		// HOP_SERVER_PROXY_TIMEOUT_SECONDS) to the DTLS forward path so that
+		// HOP_SERVER_PROXY_TIMEOUT_SECONDS) to the tunnel forward path so that
 		// excessively slow backends surface as gateway timeouts. (en)
 		ctx := r.Context()
 		if proxyTimeout > 0 {
@@ -712,7 +1685,7 @@ func newHTTPHandler(logger logging.Logger, proxyTimeout time.Duration) http.Hand
 				// Context cancelled, do not proceed.
 				return
 			default:
-				resp, err := sessWrapper.ForwardHTTP(ctx, logger, r, serviceName)
+				resp, err := tunnel.ForwardHTTP(ctx, logger, r, serviceName)
 				resultCh <- forwardResult{resp: resp, err: err}
 			}
 		}()
@@ -721,20 +1694,20 @@ func newHTTPHandler(logger logging.Logger, proxyTimeout time.Duration) http.Hand
 
 		select {
 		case <-ctx.Done():
-			log.Error("forward over dtls timed out", logging.Fields{
+			log.Error("forward over tunnel timed out", logging.Fields{
 				"timeout_seconds": int64(proxyTimeout.Seconds()),
 				"error":           ctx.Err().Error(),
 			})
-			observability.ProxyErrorsTotal.WithLabelValues("dtls_forward_timeout").Inc()
+			observability.ProxyErrorsTotal.WithLabelValues("tunnel_forward_timeout").Inc()
 			writeErrorPage(sr, r, errorpages.StatusGatewayTimeout)
 			return
 
 		case res := <-resultCh:
 			if res.err != nil {
-				log.Error("forward over dtls failed", logging.Fields{
+				log.Error("forward over tunnel failed", logging.Fields{
 					"error": res.err.Error(),
 				})
-				observability.ProxyErrorsTotal.WithLabelValues("dtls_forward_failed").Inc()
+				observability.ProxyErrorsTotal.WithLabelValues("tunnel_forward_failed").Inc()
 				writeErrorPage(sr, r, errorpages.StatusTLSHandshakeFailed)
 				return
 			}
@@ -815,6 +1788,7 @@ func main() {
 
 	logger.Info("hop-gate server starting", logging.Fields{
 		"stack":        "prometheus-loki-grafana",
+		"version":      version,
 		"http_listen":  cfg.HTTPListen,
 		"https_listen": cfg.HTTPSListen,
 		"dtls_listen":  cfg.DTLSListen,
@@ -849,6 +1823,10 @@ func main() {
 			"component": "admin_api",
 		})
 	}
+
+	// gRPC 터널 핸드셰이크에서 사용할 도메인 검증기 구성. (ko)
+	// Construct domain validator to be used by the gRPC tunnel handshake. (en)
+	domainValidator := admin.NewEntDomainValidator(logger, dbClient)
 
 	// 3. TLS 설정: ACME(lego)로 인증서를 관리하고, Debug 모드에서는 DTLS에는 self-signed 를 사용하되
 	// ACME 는 항상 시도하되 Staging 모드로 동작하도록 합니다.
@@ -963,23 +1941,6 @@ func main() {
 		}
 	}
 
-	// 4. DTLS 서버 리스너 생성 (pion/dtls 기반)
-	dtlsServer, err := dtls.NewPionServer(dtls.PionServerConfig{
-		Addr:      cfg.DTLSListen,
-		TLSConfig: dtlsTLSConfig,
-	})
-	if err != nil {
-		logger.Error("failed to start dtls server", logging.Fields{
-			"error": err.Error(),
-		})
-		os.Exit(1)
-	}
-	defer dtlsServer.Close()
-
-	logger.Info("dtls server listening", logging.Fields{
-		"addr": cfg.DTLSListen,
-	})
-
 	// 5. HTTP / HTTPS 서버 시작
 	// 프록시 타임아웃은 HOP_SERVER_PROXY_TIMEOUT_SECONDS(초 단위) 로 설정할 수 있으며,
 	// 기본값은 15초입니다. (ko)
@@ -1057,6 +2018,11 @@ func main() {
 	// 기본 HTTP → DTLS Proxy 엔트리 포인트
 	httpMux.Handle("/", httpHandler)
 
+	// gRPC server for client tunnels (OpenTunnel). (en)
+	// 클라이언트 터널(OpenTunnel)을 처리하는 gRPC 서버 인스턴스를 생성합니다. (ko)
+	grpcSrv := grpc.NewServer()
+	protocolpb.RegisterHopGateTunnelServer(grpcSrv, newGRPCTunnelServer(logger, domainValidator))
+
 	// HTTP: 평문 포트
 	httpSrv := &http.Server{
 		Addr:    cfg.HTTPListen,
@@ -1074,9 +2040,15 @@ func main() {
 	}()
 
 	// HTTPS: ACME 기반 TLS 사용 (debug 모드에서도 ACME tls config 사용 가능)
+	// gRPC(OpenTunnel)을 위해 HTTP/2(h2)가 활성화되어 있어야 합니다. (ko)
+	// HTTP/2 (h2) must be enabled for gRPC (OpenTunnel) over TLS. (en)
+	if len(acmeTLSCfg.NextProtos) == 0 {
+		acmeTLSCfg.NextProtos = []string{"h2", "http/1.1"}
+	}
+
 	httpsSrv := &http.Server{
 		Addr:      cfg.HTTPSListen,
-		Handler:   httpMux,
+		Handler:   grpcOrHTTPHandler(grpcSrv, httpMux),
 		TLSConfig: acmeTLSCfg,
 	}
 	go func() {
@@ -1090,89 +2062,7 @@ func main() {
 		}
 	}()
 
-	// 6. 도메인 검증기 준비 (ent + PostgreSQL 기반 실제 구현)
-	// Admin Plane 에서 관리하는 Domain 테이블을 사용해 (domain, client_api_key) 조합을 검증합니다.
-	domainValidator := admin.NewEntDomainValidator(logger, dbClient)
-
-	// DTLS 핸드셰이크 단계에서는 클라이언트가 제시한 도메인의 DNS(A/AAAA)가
-	// HOP_ACME_EXPECT_IPS 에 설정된 IP들 중 하나 이상을 가리키는지 추가로 검증합니다. (ko)
-	// During DTLS handshake, additionally verify that the presented domain resolves
-	// (via A/AAAA) to at least one IP configured in HOP_ACME_EXPECT_IPS. (en)
-	// EXPECT_IPS 가 비어 있으면 DNS 기반 검증은 생략하고 DB 검증만 수행합니다. (ko)
-	// If EXPECT_IPS is empty, only DB-based validation is performed. (en)
-	expectedHandshakeIPs := parseExpectedIPsFromEnv(logger, "HOP_ACME_EXPECT_IPS")
-	var validator dtls.DomainValidator = &domainGateValidator{
-		expectedIPs: expectedHandshakeIPs,
-		inner:       domainValidator,
-		logger:      logger,
-	}
-
-	// 7. DTLS Accept 루프 + Handshake
-	for {
-		sess, err := dtlsServer.Accept()
-		if err != nil {
-			logger.Error("dtls accept failed", logging.Fields{
-				"error": err.Error(),
-			})
-			continue
-		}
-
-		// 각 세션별로 goroutine 에서 핸드셰이크 및 후속 처리를 수행합니다.
-		go func(s dtls.Session) {
-			// NOTE: 세션은 HTTP↔DTLS 터널링에 계속 사용해야 하므로 이곳에서 Close 하지 않습니다.
-			// 세션 종료/타임아웃 관리는 별도의 세션 매니저(TODO)에서 담당해야 합니다.
-			hsRes, err := dtls.PerformServerHandshake(ctx, s, validator, logger)
-			if err != nil {
-				// 핸드셰이크 실패 메트릭 기록
-				observability.DTLSHandshakesTotal.WithLabelValues("failure").Inc()
-
-				// PerformServerHandshake 내부에서 이미 상세 로그를 남기므로 여기서는 요약만 기록합니다.
-				logger.Warn("dtls handshake failed", logging.Fields{
-					"session_id": s.ID(),
-					"error":      err.Error(),
-				})
-				// 핸드셰이크 실패 시 세션을 명시적으로 종료하여 invalid SNI 등 오류에서
-				// 연결이 열린 채로 남지 않도록 합니다.
-				_ = s.Close()
-				return
-			}
-
-			// Handshake 성공 메트릭 기록
-			observability.DTLSHandshakesTotal.WithLabelValues("success").Inc()
-
-			// Handshake 성공: 서버 측은 어떤 도메인이 연결되었는지 알 수 있습니다.
-			logger.Info("dtls handshake completed", logging.Fields{
-				"session_id": s.ID(),
-				"domain":     hsRes.Domain,
-			})
-
-			// Handshake 가 완료된 세션을 도메인에 매핑해 HTTP 요청 시 사용할 수 있도록 등록합니다.
-			registerSessionForDomain(hsRes.Domain, s, logger)
-
-			// Handshake 가 정상적으로 끝난 이후, 실제로 해당 도메인에 대해 ACME 인증서를 확보/연장합니다.
-			// Debug 모드에서도 ACME 는 항상 시도하지만, 위에서 HOP_ACME_USE_STAGING=true 로 설정되어
-			// Staging CA 를 사용하게 됩니다.
-			if hsRes.Domain != "" {
-				go func(domain string) {
-					acmeLogger := logger.With(logging.Fields{
-						"component": "acme_post_handshake",
-						"domain":    domain,
-						"debug":     cfg.Debug,
-					})
-					if _, err := acme.NewLegoManagerFromEnv(context.Background(), acmeLogger, []string{domain}); err != nil {
-						acmeLogger.Error("failed to ensure acme certificate after dtls handshake", logging.Fields{
-							"error": err.Error(),
-						})
-						return
-					}
-					acmeLogger.Info("acme certificate ensured after dtls handshake", nil)
-				}(hsRes.Domain)
-			}
-
-			// TODO:
-			//   - hsRes.Domain 과 연결된 세션을 proxy 레이어에 등록
-			//   - HTTP 요청을 이 세션을 통해 해당 클라이언트로 라우팅
-			//   - 세션 생명주기/타임아웃 관리 등
-		}(sess)
-	}
+	// DTLS 레이어 제거 이후에는 gRPC 및 HTTP/HTTPS 서버 goroutine 만 유지합니다. (ko)
+	// After removing the DTLS layer, only the gRPC and HTTP/HTTPS servers are kept running. (en)
+	select {}
 }

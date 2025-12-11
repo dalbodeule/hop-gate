@@ -4,7 +4,7 @@ Please draw a clean, modern system architecture diagram for a project called "Ho
 
 === High-level concept ===
 - HopGate is a reverse HTTP gateway.
-- A single public server terminates HTTPS and DTLS, and tunnels HTTP traffic to multiple clients.
+- A single public server terminates HTTPS and exposes a tunnel endpoint (gRPC/HTTP2) to tunnel HTTP traffic to multiple clients.
 - Each client runs in a private network and forwards HTTP requests to local services (127.0.0.1:PORT).
 
 === Main components to draw ===
@@ -19,8 +19,8 @@ Please draw a clean, modern system architecture diagram for a project called "Ho
         - Terminates TLS using ACME certificates for main and proxy domains.
      b. "HTTP Listener (TCP 80)"
         - Handles ACME HTTP-01 challenges and redirects HTTP to HTTPS.
-     c. "DTLS Listener (UDP 443 or 8443)"
-        - Terminates DTLS sessions from multiple clients.
+     c. "Tunnel Endpoint (gRPC)"
+        - gRPC/HTTP2 listener on the same HTTPS port (TCP 443) tunnel streams.
      d. "Admin API / Management Plane"
         - REST API base path: /api/v1/admin
         - Endpoints:
@@ -31,8 +31,9 @@ Please draw a clean, modern system architecture diagram for a project called "Ho
         - Routes incoming HTTP(S) requests to the correct client based on domain and path.
      f. "ACME Certificate Manager"
         - Automatically issues and renews TLS certificates (Let's Encrypt).
-     g. "DTLS Session Manager"
-        - Manages DTLS connections and per-domain sessions with clients.
+     g. "Tunnel Session Manager"
+        - Manages tunnel connections and per-domain sessions with clients
+          (gRPC streams).
      h. "Metrics & Logging"
         - Structured JSON logs shipped to Prometheus / Loki / Grafana stack.
 
@@ -50,35 +51,34 @@ Please draw a clean, modern system architecture diagram for a project called "Ho
    - Draw 2–3 separate client boxes to show that multiple clients can connect.
    - Each box titled "HopGate Client".
    - Inside each client box, show:
-     a. "DTLS Client"
-        - Connects to HopGate Server via DTLS.
-        - Performs handshake with:
-          - domain
-          - client_api_key
+     a. "Tunnel Client"
+        - gRPC client that opens a long-lived bi-directional gRPC stream over HTTPS (HTTP/2).
      b. "Client Proxy"
-        - Receives HTTP requests from the server over DTLS.
+        - Receives HTTP request frames from the server over the tunnel (gRPC stream).
         - Forwards them to local services such as:
           - 127.0.0.1:8080 (web)
-          - 127.0.0.1:9000 (admin)
      c. "Local Services"
         - A small group of boxes representing local HTTP servers.
 
 === Flows to highlight ===
 1) User HTTP Flow
-   - External user -> HTTPS Listener -> Reverse Proxy Core -> DTLS Session Manager -> Specific HopGate Client -> Local Service -> back through same path to the user.
+   - External user -> HTTPS Listener -> Reverse Proxy Core ->
+       gRPC Tunnel Endpoint -> specific HopGate Client (gRPC stream) -> Local Service ->
+       back through same path to the user.
 
 2) Admin Flow
    - Administrator -> Admin API (with Bearer admin key) -> PostgreSQL + ent ORM:
      - Register domain + memo -> returns client_api_key.
      - Unregister domain + client_api_key.
 
-3) DTLS Handshake Flow
-   - From client to server over DTLS:
-     - Client sends {domain, client_api_key}.
-     - Server validates against PostgreSQL Domain table.
-     - On success, both sides log:
-       - server: which domain is bound to the session.
-       - client: success message, bound domain, and local_target (local service address).
+3) Tunnel Handshake / Session Establishment Flow
+   - v1:  DTLS Handshake Flow (legacy) - (REMOVED)
+   - v2: gRPC Tunnel Establishment Flow:
+     - From client to server over HTTPS (HTTP/2):
+       - Client opens a long-lived bi-directional gRPC stream (e.g. OpenTunnel).
+       - First frame includes {domain, client_api_key} and client metadata.
+       - Server validates against PostgreSQL Domain table and associates the gRPC stream with that domain.
+       - Subsequent frames carry HTTP request/response metadata and body chunks.
 
 === Visual style ===
 - Clean flat design, no 3D.

@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package hopgate.protocol.v1;
 
-option go_package = "github.com/dalbodeule/hop-gate/internal/protocol/pb;protocolpb";
+option go_package = "internal/protocol/pb;pb";
 
 // HeaderValues 는 HTTP 헤더의 다중 값 표현을 위한 래퍼입니다.
 // HeaderValues wraps multiple header values for a single HTTP header key.

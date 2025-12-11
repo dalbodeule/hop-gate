@@ -16,6 +16,16 @@ import (
 // This matches existing 64KiB readers used around DTLS sessions (used by the JSON codec).
 const defaultDecoderBufferSize = 64 * 1024
 
+// dtlsReadBufferSize 는 pion/dtls 내부 버퍼 한계에 맞춘 읽기 버퍼 크기입니다.
+// pion/dtls 의 UnpackDatagram 함수는 8KB (8,192 bytes) 의 기본 수신 버퍼를 사용합니다.
+// DTLS는 UDP 기반이므로 한 번의 Read()에서 전체 datagram을 읽어야 하며,
+// 이 크기를 초과하는 DTLS 레코드는 처리되지 않습니다.
+// dtlsReadBufferSize matches the pion/dtls internal buffer limit.
+// pion/dtls's UnpackDatagram function uses an 8KB (8,192 bytes) receive buffer.
+// Since DTLS is UDP-based, the entire datagram must be read in a single Read() call,
+// and DTLS records exceeding this size cannot be processed.
+const dtlsReadBufferSize = 8 * 1024 // 8KB
+
 // maxProtoEnvelopeBytes 는 단일 Protobuf Envelope 의 최대 크기에 대한 보수적 상한입니다.
 // 아직 하드 리미트로 사용하지는 않지만, 향후 방어적 체크에 사용할 수 있습니다.
 const maxProtoEnvelopeBytes = 512 * 1024 // 512KiB, 충분히 여유 있는 값
@@ -46,12 +56,15 @@ func (jsonCodec) Decode(r io.Reader, env *Envelope) error {
 	return dec.Decode(env)
 }
 
-// protobufCodec 은 Protobuf + length-prefix framing 기반 WireCodec 구현입니다.
-// 한 Envelope 당 [4바이트 big-endian 길이] + [protobuf bytes] 형태로 인코딩합니다.
+// protobufCodec 은 Protobuf  length-prefix framing 기반 WireCodec 구현입니다.
+// 한 Envelope 당 [4바이트 big-endian 길이]  [protobuf bytes] 형태로 인코딩합니다.
 type protobufCodec struct{}
 
 // Encode 는 Envelope 를 Protobuf Envelope 로 변환한 뒤, length-prefix 프레이밍으로 기록합니다.
+// DTLS는 UDP 기반이므로, length prefix와 protobuf 데이터를 단일 버퍼로 합쳐 하나의 Write로 전송합니다.
 // Encode encodes an Envelope as a length-prefixed protobuf message.
+// For DTLS (UDP-based), we combine the length prefix and protobuf data into a single buffer
+// and send it with a single Write call to preserve message boundaries.
 func (protobufCodec) Encode(w io.Writer, env *Envelope) error {
 	pbEnv, err := toProtoEnvelope(env)
 	if err != nil {
@@ -83,44 +96,50 @@ func (protobufCodec) Encode(w io.Writer, env *Envelope) error {
 		return fmt.Errorf("protobuf codec: empty marshaled envelope")
 	}
 
-	var lenBuf [4]byte
 	if len(data) > int(^uint32(0)) {
 		return fmt.Errorf("protobuf codec: envelope too large: %d bytes", len(data))
 	}
-	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(data)))
 
-	if _, err := w.Write(lenBuf[:]); err != nil {
-		return fmt.Errorf("protobuf codec: write length prefix: %w", err)
-	}
-	if _, err := w.Write(data); err != nil {
-		return fmt.Errorf("protobuf codec: write payload: %w", err)
+	// DTLS 환경에서는 length prefix와 protobuf 데이터를 단일 버퍼로 합쳐서 하나의 Write로 전송
+	// For DTLS, combine length prefix and protobuf data into a single buffer
+	frame := make([]byte, 4+len(data))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(data)))
+	copy(frame[4:], data)
+
+	if _, err := w.Write(frame); err != nil {
+		return fmt.Errorf("protobuf codec: write frame: %w", err)
 	}
 	return nil
 }
 
 // Decode 는 length-prefix 프레임에서 Protobuf Envelope 를 읽어들여
 // 내부 Envelope 구조체로 변환합니다.
+// DTLS는 UDP 기반이므로, 한 번의 Read로 전체 데이터그램을 읽습니다.
 // Decode reads a length-prefixed protobuf Envelope and converts it into the internal Envelope.
+// For DTLS (UDP-based), we read the entire datagram in a single Read call.
 func (protobufCodec) Decode(r io.Reader, env *Envelope) error {
-	var lenBuf [4]byte
-	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+	// 1) 길이 prefix 4바이트를 정확히 읽는다.
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(r, header); err != nil {
 		return fmt.Errorf("protobuf codec: read length prefix: %w", err)
 	}
-	n := binary.BigEndian.Uint32(lenBuf[:])
-	if n == 0 {
+
+	length := binary.BigEndian.Uint32(header)
+	if length == 0 {
 		return fmt.Errorf("protobuf codec: zero-length envelope")
 	}
-	if n > maxProtoEnvelopeBytes {
-		return fmt.Errorf("protobuf codec: envelope too large: %d bytes (max %d)", n, maxProtoEnvelopeBytes)
+	if length > maxProtoEnvelopeBytes {
+		return fmt.Errorf("protobuf codec: envelope too large: %d bytes (max %d)", length, maxProtoEnvelopeBytes)
 	}
 
-	buf := make([]byte, int(n))
-	if _, err := io.ReadFull(r, buf); err != nil {
+	// 2) payload 를 length 바이트만큼 정확히 읽는다.
+	payload := make([]byte, int(length))
+	if _, err := io.ReadFull(r, payload); err != nil {
 		return fmt.Errorf("protobuf codec: read payload: %w", err)
 	}
 
 	var pbEnv protocolpb.Envelope
-	if err := proto.Unmarshal(buf, &pbEnv); err != nil {
+	if err := proto.Unmarshal(payload, &pbEnv); err != nil {
 		return fmt.Errorf("protobuf codec: unmarshal envelope: %w", err)
 	}
 
@@ -128,8 +147,17 @@ func (protobufCodec) Decode(r io.Reader, env *Envelope) error {
 }
 
 // DefaultCodec 은 현재 런타임에서 사용하는 기본 WireCodec 입니다.
-// 이제 Protobuf 기반 codec 을 기본으로 사용합니다.
+// 현재는 Protobuf  length-prefix 기반 codec 을 기본으로 사용합니다.
+// 서버와 클라이언트가 모두 이 버전을 사용해야 wire-format 이 일치합니다.
 var DefaultCodec WireCodec = protobufCodec{}
+
+// GetDTLSReadBufferSize 는 DTLS 세션 읽기에 사용할 버퍼 크기를 반환합니다.
+// 이 값은 pion/dtls 내부 버퍼 한계(8KB)에 맞춰져 있습니다.
+// GetDTLSReadBufferSize returns the buffer size to use for reading from DTLS sessions.
+// This value is aligned with pion/dtls's internal buffer limit (8KB).
+func GetDTLSReadBufferSize() int {
+	return dtlsReadBufferSize
+}
 
 // toProtoEnvelope 는 내부 Envelope 구조체를 Protobuf Envelope 로 변환합니다.
 // 현재 구현은 HTTP 요청/응답 및 스트림 관련 타입(StreamOpen/StreamData/StreamClose/StreamAck)을 지원합니다.
