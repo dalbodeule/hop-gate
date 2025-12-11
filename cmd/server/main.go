@@ -974,6 +974,11 @@ func hostDomainHandler(allowedDomain string, logger logging.Logger, next http.Ha
 // on a single HTTPS port, based on Content-Type and protocol (HTTP/2). (en)
 func grpcOrHTTPHandler(grpcServer *grpc.Server, httpHandler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 임시 디버그 로그: gRPC 라우팅 조건이 어떻게 보이는지 확인합니다. (ko)
+		// Temporary debug log to inspect gRPC routing conditions. (en)
+		fmt.Printf("grpcOrHTTPHandler debug: proto=%q protoMajor=%d contentType=%q host=%q path=%q\n",
+			r.Proto, r.ProtoMajor, r.Header.Get("Content-Type"), r.Host, r.URL.Path)
+
 		// gRPC 요청은 HTTP/2 + Content-Type: application/grpc 조합으로 들어옵니다. (ko)
 		// gRPC requests arrive as HTTP/2 with Content-Type: application/grpc. (en)
 		if r.ProtoMajor == 2 && strings.Contains(r.Header.Get("Content-Type"), "application/grpc") {
