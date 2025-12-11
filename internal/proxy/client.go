@@ -14,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dalbodeule/hop-gate/internal/dtls"
 	"github.com/dalbodeule/hop-gate/internal/logging"
 	"github.com/dalbodeule/hop-gate/internal/protocol"
 )
@@ -144,9 +143,9 @@ type streamReceiver struct {
 	// Input channel for envelopes dispatched from the central readLoop. (en)
 	inCh chan *protocol.Envelope
 
-	// DTLS 세션 및 직렬화 codec / 로깅 핸들. (ko)
-	// DTLS session, wire codec and logging handles. (en)
-	sess   dtls.Session
+	// 세션(write 방향) 및 직렬화 codec / 로깅 핸들. (ko)
+	// Session (write side only), wire codec and logging handles. (en)
+	sess   io.ReadWriter
 	codec  protocol.WireCodec
 	logger logging.Logger
 
@@ -161,7 +160,7 @@ type streamReceiver struct {
 // newStreamReceiver initializes a streamReceiver for a single stream ID. (en)
 func newStreamReceiver(
 	id protocol.StreamID,
-	sess dtls.Session,
+	sess io.ReadWriter,
 	codec protocol.WireCodec,
 	logger logging.Logger,
 	httpClient *http.Client,
@@ -604,7 +603,7 @@ func (p *ClientProxy) getStreamSender(id protocol.StreamID) *streamSender {
 //   - `handleStreamRequest` 내부 HTTP 매핑 로직을 `streamReceiver` 로 옮기고,
 //   - StartLoop 가 DTLS 세션 → per-stream goroutine 으로 이벤트를 분배하는 역할만 수행하도록
 //     점진적으로 리팩터링할 예정입니다.
-func (p *ClientProxy) StartLoop(ctx context.Context, sess dtls.Session) error {
+func (p *ClientProxy) StartLoop(ctx context.Context, sess io.ReadWriter) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -839,7 +838,7 @@ func (p *ClientProxy) StartLoop(ctx context.Context, sess dtls.Session) error {
 
 // handleHTTPEnvelope 는 기존 단일 HTTP 요청/응답 Envelope 경로를 처리합니다. (ko)
 // handleHTTPEnvelope handles the legacy single HTTP request/response envelope path. (en)
-func (p *ClientProxy) handleHTTPEnvelope(ctx context.Context, sess dtls.Session, env *protocol.Envelope) error {
+func (p *ClientProxy) handleHTTPEnvelope(ctx context.Context, sess io.ReadWriter, env *protocol.Envelope) error {
 	if env.HTTPRequest == nil {
 		return fmt.Errorf("http envelope missing http_request payload")
 	}
@@ -896,7 +895,7 @@ func (p *ClientProxy) handleHTTPEnvelope(ctx context.Context, sess dtls.Session,
 
 // handleStreamRequest 는 StreamOpen/StreamData/StreamClose 기반 HTTP 요청/응답 스트림을 처리합니다. (ko)
 // handleStreamRequest handles an HTTP request/response exchange using StreamOpen/StreamData/StreamClose frames. (en)
-func (p *ClientProxy) handleStreamRequest(ctx context.Context, sess dtls.Session, reader io.Reader, openEnv *protocol.Envelope) error {
+func (p *ClientProxy) handleStreamRequest(ctx context.Context, sess io.ReadWriter, reader io.Reader, openEnv *protocol.Envelope) error {
 	codec := protocol.DefaultCodec
 	log := p.Logger
 

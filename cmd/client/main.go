@@ -5,14 +5,17 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
+	"io"
 	"net"
 	"os"
 	"strings"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+
 	"github.com/dalbodeule/hop-gate/internal/config"
-	"github.com/dalbodeule/hop-gate/internal/dtls"
 	"github.com/dalbodeule/hop-gate/internal/logging"
-	"github.com/dalbodeule/hop-gate/internal/proxy"
+	protocolpb "github.com/dalbodeule/hop-gate/internal/protocol/pb"
 )
 
 // version 은 빌드 시 -ldflags "-X main.version=xxxxxxx" 로 덮어쓰이는 필드입니다.
@@ -46,6 +49,148 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// runGRPCTunnelClient 는 gRPC 기반 터널을 사용하는 실험적 클라이언트 진입점입니다. (ko)
+// runGRPCTunnelClient is an experimental entrypoint for a gRPC-based tunnel client. (en)
+func runGRPCTunnelClient(ctx context.Context, logger logging.Logger, finalCfg *config.ClientConfig) error {
+	// TLS 설정은 기존 DTLS 클라이언트와 동일한 정책을 사용합니다. (ko)
+	// TLS configuration mirrors the existing DTLS client policy. (en)
+	var tlsCfg *tls.Config
+	if finalCfg.Debug {
+		tlsCfg = &tls.Config{
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS12,
+		}
+	} else {
+		rootCAs, err := x509.SystemCertPool()
+		if err != nil || rootCAs == nil {
+			rootCAs = x509.NewCertPool()
+		}
+		tlsCfg = &tls.Config{
+			RootCAs:    rootCAs,
+			MinVersion: tls.VersionTLS12,
+		}
+	}
+
+	// finalCfg.ServerAddr 가 "host:port" 형태이므로, SNI 에는 DNS(host) 부분만 넣어야 한다.
+	host := finalCfg.ServerAddr
+	if h, _, err := net.SplitHostPort(finalCfg.ServerAddr); err == nil && strings.TrimSpace(h) != "" {
+		host = h
+	}
+	tlsCfg.ServerName = host
+
+	creds := credentials.NewTLS(tlsCfg)
+
+	log := logger.With(logging.Fields{
+		"component":    "grpc_tunnel_client",
+		"server_addr":  finalCfg.ServerAddr,
+		"domain":       finalCfg.Domain,
+		"local_target": finalCfg.LocalTarget,
+	})
+
+	log.Info("dialing grpc tunnel", nil)
+
+	conn, err := grpc.DialContext(ctx, finalCfg.ServerAddr, grpc.WithTransportCredentials(creds), grpc.WithBlock())
+	if err != nil {
+		log.Error("failed to dial grpc tunnel server", logging.Fields{
+			"error": err.Error(),
+		})
+		return err
+	}
+	defer conn.Close()
+
+	client := protocolpb.NewHopGateTunnelClient(conn)
+
+	stream, err := client.OpenTunnel(ctx)
+	if err != nil {
+		log.Error("failed to open grpc tunnel stream", logging.Fields{
+			"error": err.Error(),
+		})
+		return err
+	}
+
+	log.Info("grpc tunnel stream opened", nil)
+
+	// 초기 핸드셰이크: 도메인, API 키, 로컬 타깃 정보를 StreamOpen 헤더로 전송합니다. (ko)
+	// Initial handshake: send domain, API key, and local target via StreamOpen headers. (en)
+	headers := map[string]*protocolpb.HeaderValues{
+		"X-HopGate-Domain":       {Values: []string{finalCfg.Domain}},
+		"X-HopGate-API-Key":      {Values: []string{finalCfg.ClientAPIKey}},
+		"X-HopGate-Local-Target": {Values: []string{finalCfg.LocalTarget}},
+	}
+
+	open := &protocolpb.StreamOpen{
+		Id:          "control-0",
+		ServiceName: "control",
+		TargetAddr:  "",
+		Header:      headers,
+	}
+
+	env := &protocolpb.Envelope{
+		Payload: &protocolpb.Envelope_StreamOpen{
+			StreamOpen: open,
+		},
+	}
+
+	if err := stream.Send(env); err != nil {
+		log.Error("failed to send initial stream_open handshake", logging.Fields{
+			"error": err.Error(),
+		})
+		return err
+	}
+
+	log.Info("sent initial stream_open handshake on grpc tunnel", logging.Fields{
+		"domain":       finalCfg.Domain,
+		"local_target": finalCfg.LocalTarget,
+		"api_key_mask": maskAPIKey(finalCfg.ClientAPIKey),
+	})
+
+	// 수신 루프: 현재는 수신된 Envelope 의 타입만 로그에 남기고 종료하지 않습니다. (ko)
+	// Receive loop: currently only logs envelope payload types and keeps the tunnel open. (en)
+	for {
+		if ctx.Err() != nil {
+			log.Info("context cancelled, closing grpc tunnel client", logging.Fields{
+				"error": ctx.Err().Error(),
+			})
+			return ctx.Err()
+		}
+
+		in, err := stream.Recv()
+		if err != nil {
+			if err == io.EOF {
+				log.Info("grpc tunnel stream closed by server", nil)
+				return nil
+			}
+			log.Error("grpc tunnel receive error", logging.Fields{
+				"error": err.Error(),
+			})
+			return err
+		}
+
+		payloadType := "unknown"
+		switch in.Payload.(type) {
+		case *protocolpb.Envelope_HttpRequest:
+			payloadType = "http_request"
+		case *protocolpb.Envelope_HttpResponse:
+			payloadType = "http_response"
+		case *protocolpb.Envelope_StreamOpen:
+			payloadType = "stream_open"
+		case *protocolpb.Envelope_StreamData:
+			payloadType = "stream_data"
+		case *protocolpb.Envelope_StreamClose:
+			payloadType = "stream_close"
+		case *protocolpb.Envelope_StreamAck:
+			payloadType = "stream_ack"
+		}
+
+		log.Info("received envelope on grpc tunnel client", logging.Fields{
+			"payload_type": payloadType,
+		})
+
+		// 이후 단계에서 여기서 HTTP 프록시와의 연동(요청/응답 처리)을 구현할 예정입니다. (ko)
+		// Future 3.3 work will hook HTTP proxy logic here. (en)
+	}
 }
 
 func main() {
@@ -87,7 +232,7 @@ func main() {
 	})
 
 	// CLI 인자 정의 (env 보다 우선 적용됨)
-	serverAddrFlag := flag.String("server-addr", "", "DTLS server address (host:port)")
+	serverAddrFlag := flag.String("server-addr", "", "HopGate server address (host:port)")
 	domainFlag := flag.String("domain", "", "registered domain (e.g. api.example.com)")
 	apiKeyFlag := flag.String("api-key", "", "client API key for the domain (64 chars)")
 	localTargetFlag := flag.String("local-target", "", "local HTTP target (host:port), e.g. 127.0.0.1:8080")
@@ -136,78 +281,16 @@ func main() {
 		"debug":                 finalCfg.Debug,
 	})
 
-	// 4. DTLS 클라이언트 연결 및 핸드셰이크
 	ctx := context.Background()
 
-	// 디버그 모드에서는 서버 인증서 검증을 스킵(InsecureSkipVerify=true) 하여
-	// self-signed 테스트 인증서도 신뢰하도록 합니다.
-	// 운영 환경에서는 Debug=false 로 두고, 올바른 RootCAs / ServerName 을 갖는 tls.Config 를 사용해야 합니다.
-	var tlsCfg *tls.Config
-	if finalCfg.Debug {
-		tlsCfg = &tls.Config{
-			InsecureSkipVerify: true,
-			MinVersion:         tls.VersionTLS12,
-		}
-	} else {
-		// 운영 모드: 시스템 루트 CA + SNI(ServerName)에 서버 도메인 설정
-		rootCAs, err := x509.SystemCertPool()
-		if err != nil || rootCAs == nil {
-			rootCAs = x509.NewCertPool()
-		}
-		tlsCfg = &tls.Config{
-			RootCAs:    rootCAs,
-			MinVersion: tls.VersionTLS12,
-		}
-	}
-	// DTLS 서버 측은 SNI(ServerName)가 HOP_SERVER_DOMAIN(cfg.Domain)과 일치하는지 검사하므로,
-	// 클라이언트 TLS 설정에도 반드시 도메인을 설정해준다.
-	//
-	// finalCfg.ServerAddr 가 "host:port" 형태이므로, SNI 에는 DNS(host) 부분만 넣어야 한다.
-	host := finalCfg.ServerAddr
-	if h, _, err := net.SplitHostPort(finalCfg.ServerAddr); err == nil && strings.TrimSpace(h) != "" {
-		host = h
-	}
-	tlsCfg.ServerName = host
-
-	client := dtls.NewPionClient(dtls.PionClientConfig{
-		Addr:      finalCfg.ServerAddr,
-		TLSConfig: tlsCfg,
-	})
-
-	sess, err := client.Connect()
-	if err != nil {
-		logger.Error("failed to establish dtls session", logging.Fields{
-			"error": err.Error(),
-		})
-		os.Exit(1)
-	}
-	defer sess.Close()
-
-	hsRes, err := dtls.PerformClientHandshake(ctx, sess, logger, finalCfg.Domain, finalCfg.ClientAPIKey, finalCfg.LocalTarget)
-	if err != nil {
-		logger.Error("dtls handshake failed", logging.Fields{
+	// 현재 클라이언트는 DTLS 레이어 없이 gRPC 터널만을 사용합니다. (ko)
+	// The client now uses only the gRPC tunnel, without any DTLS layer. (en)
+	if err := runGRPCTunnelClient(ctx, logger, finalCfg); err != nil {
+		logger.Error("grpc tunnel client exited with error", logging.Fields{
 			"error": err.Error(),
 		})
 		os.Exit(1)
 	}
 
-	logger.Info("dtls handshake completed", logging.Fields{
-		"domain":       hsRes.Domain,
-		"local_target": finalCfg.LocalTarget,
-	})
-
-	// 5. DTLS 세션 위에서 서버 요청을 처리하는 클라이언트 프록시 루프 시작
-	clientProxy := proxy.NewClientProxy(logger, finalCfg.LocalTarget)
-	logger.Info("starting client proxy loop", logging.Fields{
-		"local_target": finalCfg.LocalTarget,
-	})
-
-	if err := clientProxy.StartLoop(ctx, sess); err != nil {
-		logger.Error("client proxy loop exited with error", logging.Fields{
-			"error": err.Error(),
-		})
-		os.Exit(1)
-	}
-
-	logger.Info("client proxy loop exited normally", nil)
+	logger.Info("grpc tunnel client exited normally", nil)
 }

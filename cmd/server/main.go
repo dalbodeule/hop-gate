@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/peer"
 
 	"github.com/dalbodeule/hop-gate/internal/acme"
 	"github.com/dalbodeule/hop-gate/internal/admin"
@@ -28,6 +30,7 @@ import (
 	"github.com/dalbodeule/hop-gate/internal/logging"
 	"github.com/dalbodeule/hop-gate/internal/observability"
 	"github.com/dalbodeule/hop-gate/internal/protocol"
+	protocolpb "github.com/dalbodeule/hop-gate/internal/protocol/pb"
 	"github.com/dalbodeule/hop-gate/internal/store"
 )
 
@@ -797,6 +800,8 @@ var (
 
 // statusRecorder 는 HTTP 응답 상태 코드를 캡처하기 위한 래퍼입니다.
 // Prometheus 메트릭에서 status 라벨을 기록하는 데 사용합니다.
+// statusRecorder 는 HTTP 응답 상태 코드를 캡처하기 위한 래퍼입니다.
+// Prometheus 메트릭에서 status 라벨을 기록하는 데 사용합니다.
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
@@ -805,6 +810,82 @@ type statusRecorder struct {
 func (w *statusRecorder) WriteHeader(code int) {
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
+}
+
+// grpcTunnelServer 는 HopGate gRPC 터널 서비스(HopGateTunnel)의 서버 구현체입니다. (ko)
+// grpcTunnelServer implements the HopGateTunnel gRPC service on the server side. (en)
+type grpcTunnelServer struct {
+	protocolpb.UnimplementedHopGateTunnelServer
+
+	logger logging.Logger
+}
+
+// newGRPCTunnelServer 는 gRPC 터널 서버 구현체를 생성합니다. (ko)
+// newGRPCTunnelServer constructs a new gRPC tunnel server implementation. (en)
+func newGRPCTunnelServer(logger logging.Logger) *grpcTunnelServer {
+	return &grpcTunnelServer{
+		logger: logger.With(logging.Fields{
+			"component": "grpc_tunnel",
+		}),
+	}
+}
+
+// OpenTunnel 은 클라이언트와 서버 간 장기 유지 bi-directional gRPC 스트림을 처리합니다. (ko)
+// OpenTunnel handles the long-lived bi-directional gRPC stream between the
+// server and a HopGate client. At this stage, it only logs incoming envelopes
+// and does not yet integrate with the HTTP proxy layer. (en)
+func (s *grpcTunnelServer) OpenTunnel(stream protocolpb.HopGateTunnel_OpenTunnelServer) error {
+	ctx := stream.Context()
+
+	// 원격 주소가 있으면 로그 필드에 추가합니다. (ko)
+	// Attach remote address from the peer info to log fields when available. (en)
+	fields := logging.Fields{}
+	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
+		fields["remote_addr"] = p.Addr.String()
+	}
+
+	log := s.logger.With(fields)
+	log.Info("grpc tunnel opened", nil)
+	defer log.Info("grpc tunnel closed", nil)
+
+	for {
+		env, err := stream.Recv()
+		if err != nil {
+			if err == io.EOF {
+				// 클라이언트가 정상적으로 스트림을 종료한 경우. (ko)
+				// Client closed the stream normally. (en)
+				return nil
+			}
+			log.Error("grpc tunnel receive error", logging.Fields{
+				"error": err.Error(),
+			})
+			return err
+		}
+
+		// 현재 단계에서는 수신된 Envelope 의 payload 타입만 로그에 남기고,
+		// 실제 HTTP 프록시 연동은 후속 3.3 작업에서 구현합니다. (ko)
+		// At this stage we only log the envelope payload type; HTTP proxy
+		// integration will be implemented in later 3.3 steps. (en)
+		payloadType := "unknown"
+		switch env.Payload.(type) {
+		case *protocolpb.Envelope_HttpRequest:
+			payloadType = "http_request"
+		case *protocolpb.Envelope_HttpResponse:
+			payloadType = "http_response"
+		case *protocolpb.Envelope_StreamOpen:
+			payloadType = "stream_open"
+		case *protocolpb.Envelope_StreamData:
+			payloadType = "stream_data"
+		case *protocolpb.Envelope_StreamClose:
+			payloadType = "stream_close"
+		case *protocolpb.Envelope_StreamAck:
+			payloadType = "stream_ack"
+		}
+
+		log.Info("received envelope on grpc tunnel", logging.Fields{
+			"payload_type": payloadType,
+		})
+	}
 }
 
 // hopGateOwnedHeaders 는 HopGate 서버가 스스로 관리하는 응답 헤더 목록입니다. (ko)
@@ -884,6 +965,22 @@ func hostDomainHandler(allowedDomain string, logger logging.Logger, next http.Ha
 			}
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+// grpcOrHTTPHandler 는 단일 HTTPS 포트에서 gRPC(OpenTunnel)와 일반 HTTP 요청을
+// Content-Type 및 프로토콜(HTTP/2) 기준으로 라우팅하는 헬퍼입니다. (ko)
+// grpcOrHTTPHandler routes between gRPC (OpenTunnel) and regular HTTP handlers
+// on a single HTTPS port, based on Content-Type and protocol (HTTP/2). (en)
+func grpcOrHTTPHandler(grpcServer *grpc.Server, httpHandler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// gRPC 요청은 HTTP/2 + Content-Type: application/grpc 조합으로 들어옵니다. (ko)
+		// gRPC requests arrive as HTTP/2 with Content-Type: application/grpc. (en)
+		if r.ProtoMajor == 2 && strings.Contains(r.Header.Get("Content-Type"), "application/grpc") {
+			grpcServer.ServeHTTP(w, r)
+			return
+		}
+		httpHandler.ServeHTTP(w, r)
 	})
 }
 
@@ -1370,23 +1467,6 @@ func main() {
 		}
 	}
 
-	// 4. DTLS 서버 리스너 생성 (pion/dtls 기반)
-	dtlsServer, err := dtls.NewPionServer(dtls.PionServerConfig{
-		Addr:      cfg.DTLSListen,
-		TLSConfig: dtlsTLSConfig,
-	})
-	if err != nil {
-		logger.Error("failed to start dtls server", logging.Fields{
-			"error": err.Error(),
-		})
-		os.Exit(1)
-	}
-	defer dtlsServer.Close()
-
-	logger.Info("dtls server listening", logging.Fields{
-		"addr": cfg.DTLSListen,
-	})
-
 	// 5. HTTP / HTTPS 서버 시작
 	// 프록시 타임아웃은 HOP_SERVER_PROXY_TIMEOUT_SECONDS(초 단위) 로 설정할 수 있으며,
 	// 기본값은 15초입니다. (ko)
@@ -1464,6 +1544,11 @@ func main() {
 	// 기본 HTTP → DTLS Proxy 엔트리 포인트
 	httpMux.Handle("/", httpHandler)
 
+	// gRPC server for client tunnels (OpenTunnel). (en)
+	// 클라이언트 터널(OpenTunnel)을 처리하는 gRPC 서버 인스턴스를 생성합니다. (ko)
+	grpcSrv := grpc.NewServer()
+	protocolpb.RegisterHopGateTunnelServer(grpcSrv, newGRPCTunnelServer(logger))
+
 	// HTTP: 평문 포트
 	httpSrv := &http.Server{
 		Addr:    cfg.HTTPListen,
@@ -1481,9 +1566,15 @@ func main() {
 	}()
 
 	// HTTPS: ACME 기반 TLS 사용 (debug 모드에서도 ACME tls config 사용 가능)
+	// gRPC(OpenTunnel)을 위해 HTTP/2(h2)가 활성화되어 있어야 합니다. (ko)
+	// HTTP/2 (h2) must be enabled for gRPC (OpenTunnel) over TLS. (en)
+	if len(acmeTLSCfg.NextProtos) == 0 {
+		acmeTLSCfg.NextProtos = []string{"h2", "http/1.1"}
+	}
+
 	httpsSrv := &http.Server{
 		Addr:      cfg.HTTPSListen,
-		Handler:   httpMux,
+		Handler:   grpcOrHTTPHandler(grpcSrv, httpMux),
 		TLSConfig: acmeTLSCfg,
 	}
 	go func() {
@@ -1497,89 +1588,11 @@ func main() {
 		}
 	}()
 
-	// 6. 도메인 검증기 준비 (ent + PostgreSQL 기반 실제 구현)
-	// Admin Plane 에서 관리하는 Domain 테이블을 사용해 (domain, client_api_key) 조합을 검증합니다.
-	domainValidator := admin.NewEntDomainValidator(logger, dbClient)
+	// 6. 도메인 검증기 준비 (향후 gRPC 터널 핸드셰이크에서 사용 예정). (ko)
+	// Prepare domain validator (to be used in future gRPC tunnel handshakes). (en)
+	_ = admin.NewEntDomainValidator(logger, dbClient)
 
-	// DTLS 핸드셰이크 단계에서는 클라이언트가 제시한 도메인의 DNS(A/AAAA)가
-	// HOP_ACME_EXPECT_IPS 에 설정된 IP들 중 하나 이상을 가리키는지 추가로 검증합니다. (ko)
-	// During DTLS handshake, additionally verify that the presented domain resolves
-	// (via A/AAAA) to at least one IP configured in HOP_ACME_EXPECT_IPS. (en)
-	// EXPECT_IPS 가 비어 있으면 DNS 기반 검증은 생략하고 DB 검증만 수행합니다. (ko)
-	// If EXPECT_IPS is empty, only DB-based validation is performed. (en)
-	expectedHandshakeIPs := parseExpectedIPsFromEnv(logger, "HOP_ACME_EXPECT_IPS")
-	var validator dtls.DomainValidator = &domainGateValidator{
-		expectedIPs: expectedHandshakeIPs,
-		inner:       domainValidator,
-		logger:      logger,
-	}
-
-	// 7. DTLS Accept 루프 + Handshake
-	for {
-		sess, err := dtlsServer.Accept()
-		if err != nil {
-			logger.Error("dtls accept failed", logging.Fields{
-				"error": err.Error(),
-			})
-			continue
-		}
-
-		// 각 세션별로 goroutine 에서 핸드셰이크 및 후속 처리를 수행합니다.
-		go func(s dtls.Session) {
-			// NOTE: 세션은 HTTP↔DTLS 터널링에 계속 사용해야 하므로 이곳에서 Close 하지 않습니다.
-			// 세션 종료/타임아웃 관리는 별도의 세션 매니저(TODO)에서 담당해야 합니다.
-			hsRes, err := dtls.PerformServerHandshake(ctx, s, validator, logger)
-			if err != nil {
-				// 핸드셰이크 실패 메트릭 기록
-				observability.DTLSHandshakesTotal.WithLabelValues("failure").Inc()
-
-				// PerformServerHandshake 내부에서 이미 상세 로그를 남기므로 여기서는 요약만 기록합니다.
-				logger.Warn("dtls handshake failed", logging.Fields{
-					"session_id": s.ID(),
-					"error":      err.Error(),
-				})
-				// 핸드셰이크 실패 시 세션을 명시적으로 종료하여 invalid SNI 등 오류에서
-				// 연결이 열린 채로 남지 않도록 합니다.
-				_ = s.Close()
-				return
-			}
-
-			// Handshake 성공 메트릭 기록
-			observability.DTLSHandshakesTotal.WithLabelValues("success").Inc()
-
-			// Handshake 성공: 서버 측은 어떤 도메인이 연결되었는지 알 수 있습니다.
-			logger.Info("dtls handshake completed", logging.Fields{
-				"session_id": s.ID(),
-				"domain":     hsRes.Domain,
-			})
-
-			// Handshake 가 완료된 세션을 도메인에 매핑해 HTTP 요청 시 사용할 수 있도록 등록합니다.
-			registerSessionForDomain(hsRes.Domain, s, logger)
-
-			// Handshake 가 정상적으로 끝난 이후, 실제로 해당 도메인에 대해 ACME 인증서를 확보/연장합니다.
-			// Debug 모드에서도 ACME 는 항상 시도하지만, 위에서 HOP_ACME_USE_STAGING=true 로 설정되어
-			// Staging CA 를 사용하게 됩니다.
-			if hsRes.Domain != "" {
-				go func(domain string) {
-					acmeLogger := logger.With(logging.Fields{
-						"component": "acme_post_handshake",
-						"domain":    domain,
-						"debug":     cfg.Debug,
-					})
-					if _, err := acme.NewLegoManagerFromEnv(context.Background(), acmeLogger, []string{domain}); err != nil {
-						acmeLogger.Error("failed to ensure acme certificate after dtls handshake", logging.Fields{
-							"error": err.Error(),
-						})
-						return
-					}
-					acmeLogger.Info("acme certificate ensured after dtls handshake", nil)
-				}(hsRes.Domain)
-			}
-
-			// TODO:
-			//   - hsRes.Domain 과 연결된 세션을 proxy 레이어에 등록
-			//   - HTTP 요청을 이 세션을 통해 해당 클라이언트로 라우팅
-			//   - 세션 생명주기/타임아웃 관리 등
-		}(sess)
-	}
+	// DTLS 레이어 제거 이후에는 gRPC 및 HTTP/HTTPS 서버 goroutine 만 유지합니다. (ko)
+	// After removing the DTLS layer, only the gRPC and HTTP/HTTPS servers are kept running. (en)
+	select {}
 }

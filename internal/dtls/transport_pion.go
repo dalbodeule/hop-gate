@@ -1,218 +1,58 @@
 package dtls
 
 import (
-	"context"
 	"crypto/tls"
 	"fmt"
-	"net"
 	"time"
-
-	piondtls "github.com/pion/dtls/v3"
 )
 
-// pionSession 은 pion/dtls.Conn 을 감싸 Session 인터페이스를 구현합니다.
-type pionSession struct {
-	conn *piondtls.Conn
-	id   string
-}
-
-func (s *pionSession) Read(b []byte) (int, error)  { return s.conn.Read(b) }
-func (s *pionSession) Write(b []byte) (int, error) { return s.conn.Write(b) }
-func (s *pionSession) Close() error                { return s.conn.Close() }
-func (s *pionSession) ID() string                  { return s.id }
-
-// pionServer 는 pion/dtls 기반 Server 구현입니다.
-type pionServer struct {
-	listener net.Listener
-}
-
-// PionServerConfig 는 DTLS 서버 리스너 구성을 정의합니다.
+// PionServerConfig 는 DTLS 서버 리스너 구성을 정의하는 기존 구조체를 그대로 유지합니다. (ko)
+// PionServerConfig keeps the old DTLS server listener configuration shape for compatibility. (en)
 type PionServerConfig struct {
-	// Addr 는 "0.0.0.0:443" 와 같은 UDP 리스닝 주소입니다.
-	Addr string
-
-	// TLSConfig 는 ACME 등을 통해 준비된 tls.Config 입니다.
-	// Certificates, RootCAs, ClientAuth 등의 설정이 여기서 넘어옵니다.
-	// nil 인 경우 기본 빈 tls.Config 가 사용됩니다.
+	Addr      string
 	TLSConfig *tls.Config
 }
 
-// NewPionServer 는 pion/dtls 기반 DTLS 서버를 생성합니다.
-// 내부적으로 udp 리스너를 열고, DTLS 핸드셰이크를 수행할 준비를 합니다.
-func NewPionServer(cfg PionServerConfig) (Server, error) {
-	if cfg.Addr == "" {
-		return nil, fmt.Errorf("PionServerConfig.Addr is required")
-	}
-	if cfg.TLSConfig == nil {
-		cfg.TLSConfig = &tls.Config{
-			MinVersion: tls.VersionTLS12,
-		}
-	}
-
-	udpAddr, err := net.ResolveUDPAddr("udp", cfg.Addr)
-	if err != nil {
-		return nil, fmt.Errorf("resolve udp addr: %w", err)
-	}
-
-	// tls.Config.GetCertificate (crypto/tls) → pion/dtls.GetCertificate 어댑터
-	var getCert func(*piondtls.ClientHelloInfo) (*tls.Certificate, error)
-	if cfg.TLSConfig.GetCertificate != nil {
-		tlsGetCert := cfg.TLSConfig.GetCertificate
-		getCert = func(chi *piondtls.ClientHelloInfo) (*tls.Certificate, error) {
-			if chi == nil {
-				return tlsGetCert(&tls.ClientHelloInfo{})
-			}
-			// ACME 매니저는 주로 SNI(ServerName)에 기반해 인증서를 선택하므로,
-			// 필요한 최소 필드만 복사해서 전달한다.
-			return tlsGetCert(&tls.ClientHelloInfo{
-				ServerName: chi.ServerName,
-			})
-		}
-	}
-
-	dtlsCfg := &piondtls.Config{
-		// 서버가 사용할 인증서 설정: 정적 Certificates + GetCertificate 어댑터
-		Certificates:       cfg.TLSConfig.Certificates,
-		GetCertificate:     getCert,
-		InsecureSkipVerify: cfg.TLSConfig.InsecureSkipVerify,
-		ClientAuth:         piondtls.ClientAuthType(cfg.TLSConfig.ClientAuth),
-		ClientCAs:          cfg.TLSConfig.ClientCAs,
-		RootCAs:            cfg.TLSConfig.RootCAs,
-		ServerName:         cfg.TLSConfig.ServerName,
-		// 필요 시 ExtendedMasterSecret 등을 추가 설정
-	}
-	l, err := piondtls.Listen("udp", udpAddr, dtlsCfg)
-	if err != nil {
-		return nil, fmt.Errorf("dtls listen: %w", err)
-	}
-
-	return &pionServer{
-		listener: l,
-	}, nil
-}
-
-// Accept 는 새로운 DTLS 연결을 수락하고, Session 으로 래핑합니다.
-func (s *pionServer) Accept() (Session, error) {
-	conn, err := s.listener.Accept()
-	if err != nil {
-		return nil, err
-	}
-	dtlsConn, ok := conn.(*piondtls.Conn)
-	if !ok {
-		_ = conn.Close()
-		return nil, fmt.Errorf("accepted connection is not *dtls.Conn")
-	}
-
-	id := ""
-	if ra := dtlsConn.RemoteAddr(); ra != nil {
-		id = ra.String()
-	}
-
-	return &pionSession{
-		conn: dtlsConn,
-		id:   id,
-	}, nil
-}
-
-// Close 는 DTLS 리스너를 종료합니다.
-func (s *pionServer) Close() error {
-	return s.listener.Close()
-}
-
-// pionClient 는 pion/dtls 기반 Client 구현입니다.
-type pionClient struct {
-	addr      string
-	tlsConfig *tls.Config
-	timeout   time.Duration
-}
-
-// PionClientConfig 는 DTLS 클라이언트 구성을 정의합니다.
+// PionClientConfig 는 DTLS 클라이언트 구성을 정의하는 기존 구조체를 그대로 유지합니다. (ko)
+// PionClientConfig keeps the old DTLS client configuration shape for compatibility. (en)
 type PionClientConfig struct {
-	// Addr 는 서버의 UDP 주소 (예: "example.com:443") 입니다.
-	Addr string
-
-	// TLSConfig 는 서버 인증에 사용할 tls.Config 입니다.
-	// InsecureSkipVerify=true 로 두면 서버 인증을 건너뛰므로 개발/테스트에만 사용해야 합니다.
+	Addr      string
 	TLSConfig *tls.Config
-
-	// Timeout 은 DTLS 핸드셰이크 타임아웃입니다.
-	// 0 이면 기본값 10초가 사용됩니다.
-	Timeout time.Duration
+	Timeout   time.Duration
 }
 
-// NewPionClient 는 pion/dtls 기반 DTLS 클라이언트를 생성합니다.
-func NewPionClient(cfg PionClientConfig) Client {
-	if cfg.Timeout == 0 {
-		cfg.Timeout = 10 * time.Second
-	}
-	if cfg.TLSConfig == nil {
-		// 기본값: 인증서 검증을 수행하는 안전한 설정(루트 CA 체인은 시스템 기본값 사용).
-		// 디버그 모드에서 인증서 검증을 스킵하고 싶다면, 호출 측에서
-		// TLSConfig: &tls.Config{InsecureSkipVerify: true} 를 명시적으로 전달해야 합니다.
-		cfg.TLSConfig = &tls.Config{
-			MinVersion: tls.VersionTLS12,
-		}
-	}
-	return &pionClient{
-		addr:      cfg.Addr,
-		tlsConfig: cfg.TLSConfig,
-		timeout:   cfg.Timeout,
-	}
+// disabledServer 는 DTLS 전송이 비활성화되었음을 나타내는 더미 구현입니다. (ko)
+// disabledServer is a dummy Server implementation indicating that DTLS transport is disabled. (en)
+type disabledServer struct{}
+
+func (s *disabledServer) Accept() (Session, error) {
+	return nil, fmt.Errorf("dtls transport is disabled; use gRPC tunnel instead")
 }
 
-// Connect 는 서버와 DTLS 핸드셰이크를 수행하고 Session 을 반환합니다.
-func (c *pionClient) Connect() (Session, error) {
-	if c.addr == "" {
-		return nil, fmt.Errorf("PionClientConfig.Addr is required")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
-	defer cancel()
-
-	raddr, err := net.ResolveUDPAddr("udp", c.addr)
-	if err != nil {
-		return nil, fmt.Errorf("resolve udp addr: %w", err)
-	}
-
-	dtlsCfg := &piondtls.Config{
-		// 클라이언트는 서버 인증을 위해 RootCAs/ServerName 만 사용.
-		// (현재는 클라이언트 인증서 사용 계획이 없으므로 GetCertificate 는 전달하지 않는다.)
-		Certificates:       c.tlsConfig.Certificates,
-		InsecureSkipVerify: c.tlsConfig.InsecureSkipVerify,
-		RootCAs:            c.tlsConfig.RootCAs,
-		ServerName:         c.tlsConfig.ServerName,
-	}
-
-	type result struct {
-		conn *piondtls.Conn
-		err  error
-	}
-	ch := make(chan result, 1)
-
-	go func() {
-		conn, err := piondtls.Dial("udp", raddr, dtlsCfg)
-		ch <- result{conn: conn, err: err}
-	}()
-
-	select {
-	case <-ctx.Done():
-		return nil, fmt.Errorf("dtls dial timeout: %w", ctx.Err())
-	case res := <-ch:
-		if res.err != nil {
-			return nil, fmt.Errorf("dtls dial: %w", res.err)
-		}
-		id := ""
-		if ra := res.conn.RemoteAddr(); ra != nil {
-			id = ra.String()
-		}
-		return &pionSession{
-			conn: res.conn,
-			id:   id,
-		}, nil
-	}
-}
-
-// Close 는 클라이언트 단에서 유지하는 리소스가 없으므로 no-op 입니다.
-func (c *pionClient) Close() error {
+func (s *disabledServer) Close() error {
 	return nil
+}
+
+// disabledClient 는 DTLS 전송이 비활성화되었음을 나타내는 더미 구현입니다. (ko)
+// disabledClient is a dummy Client implementation indicating that DTLS transport is disabled. (en)
+type disabledClient struct{}
+
+func (c *disabledClient) Connect() (Session, error) {
+	return nil, fmt.Errorf("dtls transport is disabled; use gRPC tunnel instead")
+}
+
+func (c *disabledClient) Close() error {
+	return nil
+}
+
+// NewPionServer 는 더 이상 실제 DTLS 서버를 생성하지 않고, 항상 에러를 반환합니다. (ko)
+// NewPionServer no longer creates a real DTLS server and always returns an error. (en)
+func NewPionServer(cfg PionServerConfig) (Server, error) {
+	return nil, fmt.Errorf("dtls transport is disabled; NewPionServer is no longer supported")
+}
+
+// NewPionClient 는 더 이상 실제 DTLS 클라이언트를 생성하지 않고, disabledClient 를 반환합니다. (ko)
+// NewPionClient no longer creates a real DTLS client and instead returns a disabledClient. (en)
+func NewPionClient(cfg PionClientConfig) Client {
+	return &disabledClient{}
 }
