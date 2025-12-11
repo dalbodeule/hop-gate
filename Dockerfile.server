@@ -52,7 +52,7 @@ COPY --from=builder /out/hop-gate-server /app/hop-gate-server
 COPY .env.example /app/.env.example
 
 # 기본 포트 노출 (실제 포트는 .env / 설정에 따라 변경 가능)
-EXPOSE 80 443/udp 443
+EXPOSE 80 443
 
 # 기본 실행 명령
 ENTRYPOINT ["/app/hop-gate-server"]
