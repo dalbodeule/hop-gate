@@ -224,286 +224,46 @@ This document tracks implementation progress against the HopGate architecture an
 
 ---
 
-### 3.3 Proxy Core / HTTP Tunneling
+### 3.3 Proxy Core / gRPC Tunneling
 
-- [ ] 서버 측 Proxy 구현 확장: [`internal/proxy/server.go`](internal/proxy/server.go)
-  - 현재 `ServerProxy` / `Router` 인터페이스와 `NewHTTPServer` 만 정의되어 있고,
-    실제 HTTP/HTTPS 리스너와 DTLS 세션 매핑 로직은 [`cmd/server/main.go`](cmd/server/main.go) 의
-    `newHTTPHandler` / `dtlsSessionWrapper.ForwardHTTP` 안에 위치합니다.
-  - Proxy 코어 로직을 proxy 레이어로 이동하는 리팩터링은 아직 진행되지 않았습니다. (3.6 항목과 연동)
+HopGate 의 최종 목표는 **TCP + TLS(HTTPS) + HTTP/2 + gRPC** 기반 터널로 HTTP 트래픽을 전달하는 것입니다.
+이 섹션에서는 DTLS 기반 초기 설계를 정리만 남기고, 실제 구현/남은 작업은 gRPC 터널 기준으로 재정의합니다.
 
-- [x] 클라이언트 측 Proxy 구현 확장: [`internal/proxy/client.go`](internal/proxy/client.go)
-  - DTLS 세션에서 `protocol.Request` 수신 → 로컬 HTTP 호출 → `protocol.Response` 전송 루프 구현.
-  - timeout/취소/에러 처리.
+- [ ] 서버 측 gRPC 터널 엔드포인트 설계/구현
+  - 외부 사용자용 HTTPS(443/TCP)와 같은 포트에서:
+    - 일반 HTTP 요청(브라우저/REST)은 기존 리버스 프록시 경로로,
+    - `Content-Type: application/grpc` 인 요청은 클라이언트 터널용 gRPC 서버로
+    라우팅하는 구조를 설계합니다.
+  - 예시: `rpc OpenTunnel(stream TunnelFrame) returns (stream TunnelFrame)` (bi-directional streaming).
+  - HTTP/2 + ALPN(h2)을 사용해 gRPC 스트림을 유지하고, 요청/응답 HTTP 메시지를 `TunnelFrame`으로 멀티플렉싱합니다.
 
-- [x] 서버 main 에 Proxy wiring 추가: [`cmd/server/main.go`](cmd/server/main.go)
-  - DTLS handshake 완료된 세션을 Proxy 라우팅 테이블에 등록.
-  - HTTPS 서버와 Proxy 핸들러 연결.
+- [ ] 클라이언트 측 gRPC 터널 설계/구현
+  - 클라이언트 프로세스는 HopGate 서버로 장기 유지 bi-di gRPC 스트림을 **하나(또는 소수 개)** 연 상태로 유지합니다.
+  - 서버로부터 들어오는 `TunnelFrame`(요청 메타데이터 + 바디 chunk)을 수신해,
+    로컬 HTTP 서비스(예: `127.0.0.1:8080`)로 proxy 하고, 응답을 다시 `TunnelFrame` 시퀀스로 전송합니다.
+  - 기존 `internal/proxy/client.go` 의 HTTP 매핑/스트림 ARQ 경험을, gRPC 메시지 단위 chunk/flow-control 설계에 참고합니다.
 
-- [x] 클라이언트 main 에 Proxy loop wiring 추가: [`cmd/client/main.go`](cmd/client/main.go)
-  - handshake 성공 후 `proxy.ClientProxy.StartLoop` 실행.
+- [ ] HTTP ↔ gRPC 터널 매핑 규약 정의
+  - 한 HTTP 요청/응답 쌍을 gRPC 스트림 상에서 어떻게 표현할지 스키마를 정의합니다:
+    - 요청: `StreamID`, method, URL, headers, body chunks
+    - 응답: `StreamID`, status, headers, body chunks, error
+  - 현재 `internal/protocol/protocol.go`의 논리 모델(Envelope/StreamOpen/StreamData/StreamClose/StreamAck)을
+    gRPC 메시지(oneof 필드 등)로 직렬화할지, 또는 새로운 gRPC 전용 메시지를 정의할지 결정합니다.
+  - Back-pressure / flow-control 은 gRPC/HTTP2의 스트림 flow-control 을 최대한 활용하고,
+    추가 application-level windowing 이 필요하면 최소한으로만 도입합니다.
 
-#### 3.3A Stream-based DTLS Tunneling / 스트림 기반 DTLS 터널링
-
-초기 HTTP 터널링 설계는 **단일 JSON Envelope + 단일 DTLS 쓰기** 방식(요청/응답 바디 전체를 한 번에 전송)이었고,
-대용량 응답 바디에서 UDP MTU 한계로 인한 `sendto: message too long` 문제가 발생할 수 있었습니다.
-이 한계를 제거하기 위해, 현재 코드는 DTLS 위 애플리케이션 프로토콜을 **스트림/프레임 기반**으로 재설계하여 `StreamOpen` / `StreamData` / `StreamClose` 를 사용합니다.
-The initial tunneling model used a **single JSON envelope + single DTLS write per HTTP message**, which could hit UDP MTU limits (`sendto: message too long`) for large bodies.
-The current implementation uses a **stream/frame-based** protocol over DTLS (`StreamOpen` / `StreamData` / `StreamClose`), and this section documents its constraints and further improvements (e.g. ARQ).
-
-고려해야 할 제약 / Constraints:
-
-- 전송 계층은 DTLS(pion/dtls)를 유지합니다.
-  The transport layer must remain DTLS (pion/dtls).
-- JSON 기반 단일 Envelope 모델에서 벗어나, HTTP 바디를 안전한 크기의 chunk 로 나누어 전송해야 합니다.
-  We must move away from the single-envelope JSON model and chunk HTTP bodies under a safe MTU.
-- UDP 특성상 일부 프레임 손실/오염에 대비해, **해당 chunk 만 재전송 요청할 수 있는 ARQ 메커니즘**이 필요합니다.
-  Given UDP characteristics, we need an application-level ARQ so that **only lost/corrupted chunks are retransmitted**.
-
-아래 단계들은 `feature/udp-stream` 브랜치에서 구현할 구체적인 작업 항목입니다.
-The following tasks describe concrete work items to be implemented on the `feature/udp-stream` branch.
-
----
-
-##### 3.3A.1 스트림 프레이밍 프로토콜 설계 (JSON 1단계)
-##### 3.3A.1 Stream framing protocol (JSON, phase 1)
-
-- [x] 스트림 프레임 타입 정리 및 확장: [`internal/protocol/protocol.go`](internal/protocol/protocol.go:35)
-  - 이미 정의된 스트림 관련 타입을 1단계에서 적극 활용합니다.
-    Reuse the already defined stream-related types in phase 1:
-    - `MessageTypeStreamOpen`, `MessageTypeStreamData`, `MessageTypeStreamClose`
-    - [`Envelope`](internal/protocol/protocol.go:52), [`StreamOpen`](internal/protocol/protocol.go:69), [`StreamData`](internal/protocol/protocol.go:80), [`StreamClose`](internal/protocol/protocol.go:86)
-  - `StreamData` 에 per-stream 시퀀스 번호를 추가합니다.
-    Add a per-stream sequence number to `StreamData`:
-    - 예시 / Example:
-      ```go
-      type StreamData struct {
-      	ID   StreamID `json:"id"`
-      	Seq  uint64   `json:"seq"`  // 0부터 시작하는 per-stream sequence
-      	Data []byte   `json:"data"`
-      }
-      ```
-
-- [x] 스트림 ACK / 재전송 제어 메시지 추가: [`internal/protocol/protocol.go`](internal/protocol/protocol.go:52)
-  - 선택적 재전송(Selective Retransmission)을 위해 `StreamAck` 메시지와 `MessageTypeStreamAck` 를 추가합니다.
-    Add `StreamAck` message and `MessageTypeStreamAck` for selective retransmission:
-    ```go
-    const (
-    	MessageTypeStreamAck MessageType = "stream_ack"
-    )
-
-    type StreamAck struct {
-    	ID         StreamID `json:"id"`              // 대상 스트림 / target stream
-    	AckSeq     uint64   `json:"ack_seq"`        // 연속으로 수신 완료한 마지막 Seq / last contiguous sequence
-    	LostSeqs   []uint64 `json:"lost_seqs"`      // 누락된 시퀀스 목록(선택) / optional list of missing seqs
-    	WindowSize uint32   `json:"window_size"`    // 선택: 허용 in-flight 프레임 수 / optional receive window
-    }
-    ```
-  - [`Envelope`](internal/protocol/protocol.go:52)에 `StreamAck *StreamAck` 필드를 추가합니다.
-    Extend `Envelope` with a `StreamAck *StreamAck` field.
-
-- [x] MTU-safe chunk 크기 정의
-	- DTLS/UDP 헤더 및 Protobuf/length-prefix 오버헤드를 고려해 안전한 payload 크기(4KiB)를 상수로 정의합니다.
-		Define a safe payload size constant (4KiB) considering DTLS/UDP headers and Protobuf/length-prefix framing.
-	- 이 값은 [`internal/protocol/protocol.go`](internal/protocol/protocol.go:32) 의 `StreamChunkSize` 로 정의되었습니다.
-		Implemented as `StreamChunkSize` in [`internal/protocol/protocol.go`](internal/protocol/protocol.go:32).
-	- 이후 HTTP 바디 스트림 터널링 구현 시, 모든 `StreamData.Data` 는 이 크기 이하 chunk 로 잘라 전송해야 합니다.
-		In the stream tunneling implementation, every `StreamData.Data` must be sliced into chunks no larger than this size.
-
----
-
-##### 3.3A.2 애플리케이션 레벨 ARQ 설계 (Selective Retransmission)
-##### 3.3A.2 Application-level ARQ (Selective Retransmission)
-
-- [x] 수신 측 ARQ 상태 관리 구현
-  - 스트림별로 `expectedSeq`, out-of-order chunk 버퍼(`received`), 누락 시퀀스 집합(`lost`)을 유지하면서,
-    in-order / out-of-order 프레임을 구분해 HTTP 바디 버퍼에 순서대로 쌓습니다.
-  - For each stream, maintain `expectedSeq`, an out-of-order buffer (`received`), and a lost-sequence set (`lost`),
-    delivering in-order frames directly to the HTTP body buffer while buffering/reordering out-of-order ones.
-
-- [x] 수신 측 StreamAck 전송 정책 구현
-  - 각 `StreamData` 수신 시점에 `AckSeq = expectedSeq - 1` 과 현재 윈도우에서 누락된 시퀀스 일부(`LostSeqs`, 상한 개수 적용)를 포함한
-    `StreamAck{AckSeq, LostSeqs}` 를 전송해 선택적 재전송을 유도합니다.
-  - On every `StreamData` frame, send `StreamAck{AckSeq, LostSeqs}` where `AckSeq = expectedSeq - 1` and `LostSeqs`
-    contains a bounded set (up to a fixed limit) of missing sequence numbers in the current receive window.
-
-- [x] 송신 측 재전송 로직 구현 (StreamAck 기반)
-  - 응답 스트림 송신 측에서 스트림별 `streamSender` 를 두고, `outstanding[seq] = payload` 로 아직 Ack 되지 않은 프레임을 추적합니다.
-  - `StreamAck{AckSeq, LostSeqs}` 수신 시:
-    - `seq <= AckSeq` 인 항목은 모두 제거하고,
-    - `LostSeqs` 에 포함된 시퀀스에 대해서만 `StreamData{ID, Seq, Data}` 를 재전송합니다.
-  - A per-stream `streamSender` tracks `outstanding[seq] = payload` for unacknowledged frames. Upon receiving
-    `StreamAck{AckSeq, LostSeqs}`, it deletes all `seq <= AckSeq` and retransmits only frames whose sequence
-    numbers appear in `LostSeqs`.
-
-> Note: 현재 구현은 StreamAck 기반 **선택적 재전송(Selective Retransmission)** 까지 포함하며,
-> 별도의 RTO(재전송 타이머) 기반 백그라운드 재전송 루프는 향후 확장 여지로 남겨둔 상태입니다.
-> Note: The current implementation covers StreamAck-based **selective retransmission**; a separate RTO-based
-> background retransmission loop is left as a potential future enhancement.
-
----
-
-##### 3.3A.3 HTTP ↔ 스트림 매핑 (서버/클라이언트)
-##### 3.3A.3 HTTP ↔ stream mapping (server/client)
-
-- [x] 서버 → 클라이언트 요청 스트림: [`cmd/server/main.go`](cmd/server/main.go:200)
-  - `ForwardHTTP` 는 스트림 기반 HTTP 요청/응답을 처리하도록 구현되어 있으며, 동작은 다음과 같습니다.
-    `ForwardHTTP` is implemented in stream mode and behaves as follows:
-    - HTTP 요청 수신 시:
-      - 새로운 `StreamID` 를 발급합니다 (세션별 증가).
-        Generate a new `StreamID` per incoming HTTP request on the DTLS session.
-      - `StreamOpen` 전송:
-        - 요청 메서드/URL/헤더를 [`StreamOpen`](internal/protocol/protocol.go:69) 의 `Header` 혹은 pseudo-header 로 encode.
-          Encode method/URL/headers into `StreamOpen.Header` or a pseudo-header scheme.
-      - 요청 바디를 읽으면서 `StreamData{ID, Seq, Data}` 를 지속적으로 전송합니다.
-        Read the HTTP request body and send it as a sequence of `StreamData` frames.
-      - 바디 종료 시 `StreamClose{ID, Error:""}` 를 전송합니다.
-        When the body ends, send `StreamClose{ID, Error:""}`.
-    - 응답 수신:
-      - 클라이언트에서 오는 역방향 `StreamOpen` 으로 HTTP status/header 를 수신하고,
-        이를 `http.ResponseWriter` 에 반영합니다.
-        Receive response status/headers via reverse-direction `StreamOpen` and map them to `http.ResponseWriter`.
-      - 연속되는 `StreamData` 를 수신할 때마다 `http.ResponseWriter.Write` 로 chunk 를 바로 전송합니다.
-        For each `StreamData`, write the chunk directly to the HTTP response.
-      - `StreamClose` 수신 시 응답 종료 및 스트림 자원 정리.
-        On `StreamClose`, finish the response and clean up per-stream state.
-
-- [x] 클라이언트에서의 요청 처리 스트림: [`internal/proxy/client.go`](internal/proxy/client.go:200)
-  - 서버로부터 들어오는 `StreamOpen{ID, ...}` 을 수신하면,
-    새로운 goroutine 을 띄워 해당 ID에 대한 로컬 HTTP 요청을 수행합니다.
-    On receiving `StreamOpen{ID, ...}` from the server, spawn a goroutine to handle the local HTTP request for that stream ID.
-  - 스트림별로 `io.Pipe` 또는 채널 기반 바디 리더를 준비하고,
-    `StreamData` 프레임을 수신할 때마다 이 파이프에 쓰도록 합니다.
-    Prepare an `io.Pipe` (or channel-backed reader) per stream and write incoming `StreamData` chunks into it.
-  - 로컬 HTTP 클라이언트 응답은 반대로:
-    For the local HTTP client response:
-    - 응답 status/header → `StreamOpen` (client → server)
-    - 응답 바디 → 여러 개의 `StreamData`
-    - 종료 시점에 `StreamClose` 전송
-      Send `StreamOpen` (status/headers), then a sequence of `StreamData`, followed by `StreamClose` when done.
-
----
-
-##### 3.3A.4 JSON → 바이너리 직렬화로의 잠재적 전환 (2단계)
-##### 3.3A.4 JSON → binary serialization (potential phase 2)
-
-- [x] JSON 기반 스트림 프로토콜의 1단계 구현/안정화 이후, 직렬화 포맷 재검토 및 Protobuf 전환
-  - 현재는 JSON 대신 Protobuf length-prefix `Envelope` 포맷을 기본으로 사용합니다.
-    The runtime now uses a Protobuf-based, length-prefixed `Envelope` format instead of JSON.
-  - HTTP/스트림 payload 는 여전히 MTU-safe 크기(예: 4KiB, `StreamChunkSize`)로 제한되어 있어, 단일 프레임이 과도하게 커지지 않습니다.
-    HTTP/stream payloads remain bounded to an MTU-safe size (e.g. 4KiB via `StreamChunkSize`), so individual frames stay small.
-- [x] length-prefix 이진 프레임(Protobuf)으로 전환
-  - 동일한 logical model (`StreamOpen` / `StreamData(seq)` / `StreamClose` / `StreamAck`)을 유지한 채,
-    wire-format 을 Protobuf length-prefix binary 프레이밍으로 교체했고, 이는 `protobufCodec` 으로 구현되었습니다.
-    We now keep the same logical model while using Protobuf length-prefixed framing via `protobufCodec`.
-- [x] 이 전환은 `internal/protocol` 내 직렬화 레이어를 얇은 abstraction 으로 감싸 구현했습니다.
-  - [`internal/protocol/codec.go`](internal/protocol/codec.go:130) 에 `WireCodec` 인터페이스와 Protobuf 기반 `DefaultCodec` 을 도입해,
-    호출자는 `protocol.DefaultCodec` 만 사용하고, JSON codec 은 보조 용도로만 남아 있습니다.
-    In [`internal/protocol/codec.go`](internal/protocol/codec.go:130), the `WireCodec` abstraction and Protobuf-based `DefaultCodec` allow callers to use only `protocol.DefaultCodec` while JSON remains as an auxiliary codec.
-
----
- 
-##### 3.3B DTLS Session Multiplexing / 세션 내 다중 HTTP 요청 처리
-
-현재 구현은 클라이언트 측에서 단일 DTLS 세션 내에 **동시에 하나의 HTTP 요청 스트림만** 처리할 수 있습니다.
-`ClientProxy.handleStreamRequest` 가 DTLS 세션의 reader 를 직접 소비하기 때문에, 동일 세션에서 두 번째 `StreamOpen` 이 섞여 들어오면 프로토콜 위반으로 간주되고 세션이 끊어집니다.
-이 섹션은 **클라이언트 측 스트림 demux + per-stream goroutine 구조**를 도입해, 하나의 DTLS 세션 안에서 여러 HTTP 요청을 안전하게 병렬 처리하기 위한 단계입니다.
-
-Currently, the client can effectively handle **only one HTTP request stream at a time per DTLS session**.
-Because `ClientProxy.handleStreamRequest` directly consumes the DTLS session reader, an additional `StreamOpen` for a different stream interleaving on the same session is treated as a protocol error and tears down the session.
-This section introduces a **client-side stream demultiplexer + per-stream goroutines** to safely support multiple concurrent HTTP requests within a single DTLS session.
-
----
-
-##### 3.3B.1 클라이언트 측 중앙 readLoop → 스트림 demux 설계
-##### 3.3B.1 Design client-side central readLoop → per-stream demux
-
-- [x] `ClientProxy.StartLoop` 의 역할을 명확히 분리
-  - DTLS 세션에서 `Envelope` 를 연속해서 읽어들이는 **중앙 readLoop** 를 유지하되,
-  - 개별 스트림의 HTTP 처리 로직(현재 `handleStreamRequest` 내부 로직)을 분리해 별도 타입/구조체로 옮길 계획을 문서화합니다.
-- [x] 스트림 demux 위한 자료구조 설계
-  - `map[protocol.StreamID]*streamReceiver` 형태의 수신측 스트림 상태 테이블을 정의합니다.
-  - 각 `streamReceiver` 는 자신만의 입력 채널(예: `inCh chan *protocol.Envelope`)을 가져, 중앙 readLoop 로부터 `StreamOpen/StreamData/StreamClose` 를 전달받도록 합니다.
-- [x] 중앙 readLoop 에서 스트림별 라우팅 규칙 정의
-  - `Envelope.Type` 에 따라:
-    - `StreamOpen` / `StreamData` / `StreamClose`:
-      - `streamID` 를 추출하고, 해당 `streamReceiver` 의 `inCh` 로 전달.
-      - `StreamOpen` 수신 시에는 아직 없는 경우 `streamReceiver` 를 생성 후 등록.
-    - `StreamAck`:
-      - 송신 측 ARQ(`streamSender`) 용 테이블(이미 구현된 구조)을 찾아 재전송 로직으로 전달.
-  - 이 설계를 통해 중앙 readLoop 는 **DTLS 세션 → 스트림 단위 이벤트 분배**만 담당하도록 제한합니다.
-
----
-
-##### 3.3B.2 streamReceiver 타입 설계 및 HTTP 매핑 리팩터링
-##### 3.3B.2 Design streamReceiver type and refactor HTTP mapping
-
-- [x] `streamReceiver` 타입 정의
-  - 필드 예시:
-    - `id protocol.StreamID`
-    - 수신 ARQ 상태: `expectedSeq`, `received map[uint64][]byte`, `lost map[uint64]struct{}`
-    - 입력 채널: `inCh chan *protocol.Envelope`
-    - DTLS 세션/codec/logging 핸들: `sess dtls.Session`, `codec protocol.WireCodec`, `logger logging.Logger`
-    - 로컬 HTTP 호출 관련: `HTTPClient *http.Client`, `LocalTarget string`
-  - 역할:
-    - 서버에서 온 `StreamOpen`/`StreamData`/`StreamClose` 를 순서대로 처리해 로컬 HTTP 요청을 구성하고,
-    - 로컬 HTTP 응답을 다시 `StreamOpen`/`StreamData`/`StreamClose` 로 역방향 전송합니다.
-- [x] 기존 `ClientProxy.handleStreamRequest` 의 로직을 `streamReceiver` 로 이전
-  - 현재 `handleStreamRequest` 안에서 수행하던 작업을 단계적으로 옮깁니다:
-    - `StreamOpen` 의 pseudo-header 에서 HTTP 메서드/URL/헤더를 복원.
-    - 요청 바디 수신용 수신 측 ARQ(`expectedSeq`, `received`, `lost`) 처리.
-    - 로컬 HTTP 요청 생성/실행 및 에러 처리.
-    - 응답을 4KiB `StreamData` chunk 로 전송 + 송신 측 ARQ(`streamSender.register`) 기록.
-  - 이때 **DTLS reader 를 직접 읽던 부분**은 제거하고, 대신 `inCh` 에서 전달된 `Envelope` 만 사용하도록 리팩터링합니다.
-- [x] streamReceiver 생명주기 관리
-  - `StreamClose` 수신 시:
-    - 로컬 HTTP 요청 바디 구성 종료.
-    - 로컬 HTTP 요청 실행 및 응답 스트림 전송 완료 후,
-    - `streamReceivers[streamID]` 에서 자신을 제거하고 goroutine 을 종료하는 정책을 명확히 정의합니다.
-
----
-
-##### 3.3B.3 StartLoop 와 streamReceiver 통합
-##### 3.3B.3 Integrate StartLoop and streamReceiver
-
-- [x] `ClientProxy.StartLoop` 을 “중앙 readLoop + demux” 로 단순화
-  - `MessageTypeStreamOpen` 수신 시:
-    - `streamID := env.StreamOpen.ID` 를 기준으로 기존 `streamReceiver` 존재 여부를 검사.
-    - 없으면 새 `streamReceiver` 생성 후, goroutine 을 띄우고 `inCh <- env` 로 첫 메시지 전달.
-  - `MessageTypeStreamData` / `MessageTypeStreamClose` 수신 시:
-    - 해당 `streamReceiver` 의 `inCh` 로 그대로 전달.
-  - `MessageTypeStreamAck` 는 기존처럼 송신 측 `streamSender` 로 라우팅.
-- [x] 에러/종료 처리 전략 정리
-  - 개별 `streamReceiver` 에서 발생하는 에러는:
-    - 로컬 HTTP 에러 → 스트림 응답에 5xx/에러 바디로 반영.
-    - 프로토콜 위반(예: 잘못된 순서의 `StreamClose`) → 해당 스트림만 정리하고 세션은 유지하는지 여부를 정의.
-  - DTLS 세션 레벨 에러(EOF, decode 실패 등)는:
-    - 모든 `streamReceiver` 의 `inCh` 를 닫고,
-    - 이후 클라이언트 전체 루프를 종료하는 방향으로 합의합니다.
-
----
-
-##### 3.3B.4 세션 단위 직렬화 락 제거 및 멀티플렉싱 검증
-##### 3.3B.4 Remove session-level serialization lock and validate multiplexing
-
-- [x] 서버 측 세션 직렬화 락 제거 계획 수립
-  - 현재 서버는 [`dtlsSessionWrapper`](cmd/server/main.go:111)에 `requestMu` 를 두어,
-    - 동일 DTLS 세션에서 동시에 하나의 `ForwardHTTP` 만 수행하도록 직렬화하고 있습니다.
-  - 클라이언트 측 멀티플렉싱이 안정화되면, `requestMu` 를 제거하고
-    - 하나의 세션 안에서 여러 HTTP 요청이 각기 다른 `StreamID` 로 병렬 진행되도록 허용합니다.
-- [ ] E2E 멀티플렉싱 테스트 시나리오 정의
-  - 하나의 DTLS 세션 위에서:
-    - 동시에 여러 정적 리소스(`/css`, `/js`, `/img`) 요청.
-    - 큰 응답(수 MB 파일)과 작은 응답(API JSON)이 섞여 있는 시나리오.
+- [ ] gRPC 터널 기반 E2E 플로우 정의/테스트 계획
+  - 하나의 gRPC 스트림 위에서:
+    - 동시에 여러 정적 리소스(`/css`, `/js`, `/img`) 요청,
+    - 큰 응답(수 MB 파일)과 작은 응답(API JSON)이 섞여 있는 시나리오,
+    - 클라이언트 재시작/네트워크 단절 후 재연결 시나리오
+    를 포함하는 테스트 플랜을 작성합니다.
   - 기대 동작:
-    - 어떤 요청이 느리더라도, 다른 요청이 세션 내부 큐잉 때문에 과도하게 지연되지 않고 병렬로 완료되는지 확인.
-    - 클라이언트/서버 로그에 프로토콜 위반(`unexpected envelope type ...`) 이 더 이상 발생하지 않는지 확인.
-- [ ] 관측성/메트릭에 멀티플렉싱 관련 라벨/필드 추가(선택)
-  - 필요 시:
-    - 세션당 동시 활성 스트림 수,
-    - 스트림 수명(요청-응답 왕복 시간),
-    - 세션 내 스트림 에러 수
-    를 관찰할 수 있는 메트릭/로그 필드를 설계합니다.
+    - 느린 요청이 있더라도 다른 요청이 **같은 TCP 연결/스트림 집합 내에서** 과도하게 지연되지 않을 것.
+    - 서버/클라이언트 로그에 프로토콜 위반 경고(`unexpected frame ...`)가 발생하지 않을 것.
+
+> Note: 기존 DTLS 기반 스트림/ARQ/멀티플렉싱(3.3A/3.3B)의 작업 내역은
+> 구현 경험/아이디어 참고용으로만 유지하며, 신규 기능/운영 계획은 gRPC 터널을 기준으로 진행합니다.
 
 ---
 
@@ -539,7 +299,7 @@ This section introduces a **client-side stream demultiplexer + per-stream gorout
 
 ### 3.6 Hardening / 안정성 & 구성
 
-- [ ] 설정 유효성 검사 추가
+- [x] 설정 유효성 검사 추가
   - 필수 env 누락/오류에 대한 명확한 에러 메시지.
 
 - [ ] 에러 처리/재시도 정책
