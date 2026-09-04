@@ -20,7 +20,7 @@ type yamuxTunnelSession struct {
 	logger  logging.Logger
 }
 
-func (t *yamuxTunnelSession) ForwardHTTP(ctx context.Context, logger logging.Logger, req *http.Request, serviceName string) (*tunnel.Response, error) {
+func (t *yamuxTunnelSession) ForwardHTTP(ctx context.Context, logger logging.Logger, req *http.Request, serviceName string, w http.ResponseWriter) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -34,7 +34,7 @@ func (t *yamuxTunnelSession) ForwardHTTP(ctx context.Context, logger logging.Log
 	}
 	stream, err := t.session.Open(ctx, meta)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer stream.Close()
 	if deadline, ok := ctx.Deadline(); ok {
@@ -44,28 +44,188 @@ func (t *yamuxTunnelSession) ForwardHTTP(ctx context.Context, logger logging.Log
 	request := req.Clone(ctx)
 	request.RequestURI = ""
 	if err := request.Write(stream); err != nil {
-		return nil, fmt.Errorf("write HTTP request to yamux stream: %w", err)
+		return fmt.Errorf("write HTTP request to yamux stream: %w", err)
 	}
 	resp, err := http.ReadResponse(bufio.NewReader(stream), req)
 	if err != nil {
-		return nil, fmt.Errorf("read HTTP response from yamux stream: %w", err)
+		return fmt.Errorf("read HTTP response from yamux stream: %w", err)
 	}
 	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read HTTP response body from yamux stream: %w", err)
-	}
-	result := &tunnel.Response{
-		RequestID: "yamux",
-		Status:    resp.StatusCode,
-		Header:    make(map[string][]string, len(resp.Header)),
-		Body:      body,
-	}
 	for key, values := range resp.Header {
-		result.Header[key] = append([]string(nil), values...)
+		if _, owned := hopGateOwnedHeaders[http.CanonicalHeaderKey(key)]; owned {
+			continue
+		}
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
 	}
-	return result, nil
+	w.WriteHeader(resp.StatusCode)
+	if _, err := io.Copy(flushingResponseWriter{ResponseWriter: w}, resp.Body); err != nil {
+		return fmt.Errorf("stream HTTP response body from yamux: %w", err)
+	}
+	return nil
+}
+
+type websocketForwarder interface {
+	ForwardWebSocket(context.Context, logging.Logger, *http.Request, string, http.ResponseWriter) error
+}
+
+func isWebSocketRequest(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
+		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
+}
+
+func isExtendedConnectWebSocketRequest(r *http.Request) bool {
+	return r.ProtoMajor >= 2 && r.Method == http.MethodConnect &&
+		strings.EqualFold(r.Proto, "websocket")
+}
+
+func isSSERequest(r *http.Request) bool {
+	for _, value := range r.Header.Values("Accept") {
+		for _, mediaType := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(strings.SplitN(mediaType, ";", 2)[0]), "text/event-stream") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (t *yamuxTunnelSession) ForwardWebSocket(ctx context.Context, logger logging.Logger, req *http.Request, serviceName string, w http.ResponseWriter) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := w.(http.Hijacker); !ok {
+		return fmt.Errorf("websocket upgrade requires HTTP/1.1 hijacking")
+	}
+	stream, err := t.session.Open(ctx, tunnel.StreamMeta{
+		Kind:    "websocket",
+		Service: serviceName,
+		Method:  req.Method,
+		Path:    req.URL.RequestURI(),
+		Host:    req.Host,
+		Headers: req.Header,
+	})
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = stream.SetDeadline(deadline)
+	}
+	request := req.Clone(ctx)
+	request.RequestURI = ""
+	if err := request.Write(stream); err != nil {
+		return fmt.Errorf("write WebSocket request to yamux stream: %w", err)
+	}
+	backendReader := bufio.NewReader(stream)
+	backendResponse, err := http.ReadResponse(backendReader, req)
+	if err != nil {
+		return fmt.Errorf("read WebSocket handshake from yamux stream: %w", err)
+	}
+	if backendResponse.StatusCode != http.StatusSwitchingProtocols {
+		defer backendResponse.Body.Close()
+		w.WriteHeader(backendResponse.StatusCode)
+		_, _ = io.Copy(w, backendResponse.Body)
+		return fmt.Errorf("backend rejected WebSocket upgrade with status %d", backendResponse.StatusCode)
+	}
+
+	hijacker := w.(http.Hijacker)
+	clientConn, clientRW, err := hijacker.Hijack()
+	if err != nil {
+		return fmt.Errorf("hijack public WebSocket connection: %w", err)
+	}
+	defer clientConn.Close()
+	if err := backendResponse.Write(clientRW); err != nil {
+		return fmt.Errorf("write WebSocket handshake to public client: %w", err)
+	}
+	if err := clientRW.Flush(); err != nil {
+		return fmt.Errorf("flush WebSocket handshake: %w", err)
+	}
+
+	return relayConnections(clientRW.Reader, stream, clientConn, backendReader)
+}
+
+func (t *yamuxTunnelSession) ForwardExtendedConnect(ctx context.Context, logger logging.Logger, req *http.Request, serviceName string, w http.ResponseWriter) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stream, err := t.session.Open(ctx, tunnel.StreamMeta{
+		Kind:    "websocket",
+		Service: serviceName,
+		Method:  req.Method,
+		Path:    req.URL.RequestURI(),
+		Host:    req.Host,
+		Headers: req.Header,
+	})
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = stream.SetDeadline(deadline)
+	}
+
+	request := req.Clone(ctx)
+	request.Method = http.MethodGet
+	request.RequestURI = ""
+	request.Body = http.NoBody
+	request.ContentLength = 0
+	request.Header = request.Header.Clone()
+	request.Header.Del(":protocol")
+	request.Header.Set("Connection", "Upgrade")
+	request.Header.Set("Upgrade", "websocket")
+	if err := request.Write(stream); err != nil {
+		return fmt.Errorf("write translated WebSocket request to yamux stream: %w", err)
+	}
+
+	backendReader := bufio.NewReader(stream)
+	backendResponse, err := http.ReadResponse(backendReader, request)
+	if err != nil {
+		return fmt.Errorf("read translated WebSocket handshake from yamux stream: %w", err)
+	}
+	defer backendResponse.Body.Close()
+	if backendResponse.StatusCode != http.StatusSwitchingProtocols {
+		w.WriteHeader(http.StatusBadGateway)
+		return fmt.Errorf("local WebSocket rejected Extended CONNECT with status %d", backendResponse.StatusCode)
+	}
+
+	for key, values := range backendResponse.Header {
+		if _, owned := hopGateOwnedHeaders[http.CanonicalHeaderKey(key)]; owned {
+			continue
+		}
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(http.StatusOK)
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return relayConnections(req.Body, stream, flushingResponseWriter{ResponseWriter: w}, backendReader)
+}
+
+type flushingResponseWriter struct{ http.ResponseWriter }
+
+func (w flushingResponseWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(p)
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return n, err
+}
+
+func relayConnections(clientReader io.Reader, stream io.Writer, clientWriter io.Writer, backend io.Reader) error {
+	result := make(chan error, 2)
+	go func() {
+		_, err := io.Copy(stream, clientReader)
+		result <- err
+	}()
+	go func() {
+		_, err := io.Copy(clientWriter, backend)
+		result <- err
+	}()
+	return <-result
 }
 
 func serveYamuxTunnel(ctx context.Context, address string, tlsConfig *tls.Config, logger logging.Logger, validator tunnel.DomainValidator) error {

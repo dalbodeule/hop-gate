@@ -6,12 +6,3 @@ import "context"
 type DomainValidator interface {
 	ValidateDomainAPIKey(ctx context.Context, domain, clientAPIKey string) error
 }
-
-// Response is the response returned by a tunnel transport to the public HTTP ingress.
-type Response struct {
-	RequestID string
-	Status    int
-	Header    map[string][]string
-	Body      []byte
-	Error     string
-}

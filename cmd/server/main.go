@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"fmt"
 	"io"
 	stdfs "io/fs"
 	"net"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/quic-go/quic-go/http3"
 
 	"github.com/dalbodeule/hop-gate/internal/acme"
 	"github.com/dalbodeule/hop-gate/internal/admin"
@@ -22,7 +25,6 @@ import (
 	"github.com/dalbodeule/hop-gate/internal/logging"
 	"github.com/dalbodeule/hop-gate/internal/observability"
 	"github.com/dalbodeule/hop-gate/internal/store"
-	"github.com/dalbodeule/hop-gate/internal/tunnel"
 )
 
 var version = "dev"
@@ -42,7 +44,11 @@ var (
 )
 
 type forwardTunnel interface {
-	ForwardHTTP(context.Context, logging.Logger, *http.Request, string) (*tunnel.Response, error)
+	ForwardHTTP(context.Context, logging.Logger, *http.Request, string, http.ResponseWriter) error
+}
+
+type extendedConnectForwarder interface {
+	ForwardExtendedConnect(context.Context, logging.Logger, *http.Request, string, http.ResponseWriter) error
 }
 
 func registerTunnelForDomain(domain string, sess forwardTunnel, logger logging.Logger) string {
@@ -135,9 +141,35 @@ func hostDomainHandler(allowedDomain string, logger logging.Logger, next http.Ha
 }
 
 func (w *statusRecorder) WriteHeader(code int) {
+	if w.status != 0 {
+		return
+	}
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
 }
+
+func (w *statusRecorder) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *statusRecorder) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("underlying response writer does not support hijacking")
+	}
+	return hijacker.Hijack()
+}
+
+func (w *statusRecorder) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func newHTTPHandler(logger logging.Logger, proxyTimeout time.Duration) http.Handler {
 	// ACME webroot (for HTTP-01) is read from env; must match HOP_ACME_WEBROOT used by lego.
@@ -176,7 +208,7 @@ func newHTTPHandler(logger logging.Logger, proxyTimeout time.Duration) http.Hand
 		// 상태 코드 캡처를 위한 래퍼
 		sr := &statusRecorder{
 			ResponseWriter: w,
-			status:         http.StatusOK,
+			status:         0,
 		}
 		// 보안/식별 헤더를 공통으로 설정합니다. (ko)
 		// Configure common security and identity headers. (en)
@@ -312,78 +344,52 @@ func newHTTPHandler(logger logging.Logger, proxyTimeout time.Duration) http.Hand
 		// HOP_SERVER_PROXY_TIMEOUT_SECONDS) to the tunnel forward path so that
 		// excessively slow backends surface as gateway timeouts. (en)
 		ctx := r.Context()
-		if proxyTimeout > 0 {
+		if proxyTimeout > 0 && !isSSERequest(r) {
 			var cancel context.CancelFunc
 			ctx, cancel = context.WithTimeout(ctx, proxyTimeout)
 			defer cancel()
 		}
 
-		type forwardResult struct {
-			resp *tunnel.Response
-			err  error
-		}
-		resultCh := make(chan forwardResult, 1)
-
-		go func() {
-			select {
-			case <-ctx.Done():
-				// Context cancelled, do not proceed.
+		if isExtendedConnectWebSocketRequest(r) {
+			extendedTunnel, ok := activeTunnel.(extendedConnectForwarder)
+			if !ok {
+				writeErrorPage(sr, r, http.StatusNotImplemented)
 				return
-			default:
-				resp, err := activeTunnel.ForwardHTTP(ctx, logger, r, serviceName)
-				resultCh <- forwardResult{resp: resp, err: err}
 			}
-		}()
-
-		var protoResp *tunnel.Response
-
-		select {
-		case <-ctx.Done():
-			log.Error("forward over tunnel timed out", logging.Fields{
-				"timeout_seconds": int64(proxyTimeout.Seconds()),
-				"error":           ctx.Err().Error(),
-			})
-			observability.ProxyErrorsTotal.WithLabelValues("tunnel_forward_timeout").Inc()
-			writeErrorPage(sr, r, errorpages.StatusGatewayTimeout)
+			if err := extendedTunnel.ForwardExtendedConnect(ctx, logger, r, serviceName, sr); err != nil && sr.status == 0 {
+				log.Error("HTTP/2 Extended CONNECT forwarding failed", logging.Fields{"error": err.Error()})
+				writeErrorPage(sr, r, errorpages.StatusTLSHandshakeFailed)
+			}
 			return
+		}
 
-		case res := <-resultCh:
-			if res.err != nil {
-				log.Error("forward over tunnel failed", logging.Fields{
-					"error": res.err.Error(),
-				})
+		if isWebSocketRequest(r) {
+			wsTunnel, ok := activeTunnel.(websocketForwarder)
+			if !ok {
+				writeErrorPage(sr, r, http.StatusNotImplemented)
+				return
+			}
+			if err := wsTunnel.ForwardWebSocket(ctx, logger, r, serviceName, sr); err != nil && sr.status == 0 {
+				log.Error("WebSocket forwarding failed", logging.Fields{"error": err.Error()})
+				writeErrorPage(sr, r, errorpages.StatusTLSHandshakeFailed)
+			}
+			return
+		}
+
+		if err := activeTunnel.ForwardHTTP(ctx, logger, r, serviceName, sr); err != nil && sr.status == 0 {
+			log.Error("forward over tunnel failed", logging.Fields{"error": err.Error()})
+			if ctx.Err() != nil {
+				observability.ProxyErrorsTotal.WithLabelValues("tunnel_forward_timeout").Inc()
+				writeErrorPage(sr, r, errorpages.StatusGatewayTimeout)
+			} else {
 				observability.ProxyErrorsTotal.WithLabelValues("tunnel_forward_failed").Inc()
 				writeErrorPage(sr, r, errorpages.StatusTLSHandshakeFailed)
-				return
 			}
-			protoResp = res.resp
-		}
-
-		// 응답 헤더/바디 복원
-		for k, vs := range protoResp.Header {
-			// HopGate 가 소유한 보안/식별 헤더는 백엔드 값 대신 서버 값만 사용합니다. (ko)
-			// For security/identity headers owned by HopGate, ignore backend values. (en)
-			if _, ok := hopGateOwnedHeaders[http.CanonicalHeaderKey(k)]; ok {
-				continue
-			}
-			for _, v := range vs {
-				sr.Header().Add(k, v)
-			}
-		}
-		if protoResp.Status == 0 {
-			protoResp.Status = http.StatusOK
-		}
-		sr.WriteHeader(protoResp.Status)
-		if len(protoResp.Body) > 0 {
-			if _, err := sr.Write(protoResp.Body); err != nil {
-				log.Warn("failed to write http response body", logging.Fields{
-					"error": err.Error(),
-				})
-			}
+			return
 		}
 
 		log.Info("http request completed", logging.Fields{
-			"status":       protoResp.Status,
+			"status":       sr.status,
 			"elapsed_ms":   time.Since(start).Milliseconds(),
 			"service_name": serviceName,
 		})
@@ -573,6 +579,24 @@ func main() {
 	// 기본 HTTP → yamux Proxy 엔트리 포인트
 	httpMux.Handle("/", httpHandler)
 
+	// HTTP/3 uses the same ingress handler and certificates as HTTPS, but listens
+	// on UDP separately from the TCP listener.
+	if len(acmeTLSCfg.NextProtos) == 0 {
+		acmeTLSCfg.NextProtos = []string{"h2", "http/1.1"}
+	}
+	http3Server := &http3.Server{
+		Addr:      cfg.HTTPSListen,
+		Handler:   nil,
+		TLSConfig: http3.ConfigureTLSConfig(acmeTLSCfg.Clone()),
+	}
+	publicHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor < 3 {
+			_ = http3Server.SetQUICHeaders(w.Header())
+		}
+		httpMux.ServeHTTP(w, r)
+	})
+	http3Server.Handler = publicHandler
+
 	go func() {
 		if err := serveYamuxTunnel(context.Background(), cfg.TunnelListen, acmeTLSCfg, logger, domainValidator); err != nil {
 			logger.Error("yamux tunnel server stopped", logging.Fields{"error": err.Error()})
@@ -596,14 +620,9 @@ func main() {
 		}
 	}()
 
-	// HTTPS: ACME 기반 TLS 사용 (debug 모드에서도 ACME tls config 사용 가능)
-	if len(acmeTLSCfg.NextProtos) == 0 {
-		acmeTLSCfg.NextProtos = []string{"h2", "http/1.1"}
-	}
-
 	httpsSrv := &http.Server{
 		Addr:      cfg.HTTPSListen,
-		Handler:   httpMux,
+		Handler:   publicHandler,
 		TLSConfig: acmeTLSCfg,
 	}
 	go func() {
@@ -614,6 +633,13 @@ func main() {
 			logger.Error("https server error", logging.Fields{
 				"error": err.Error(),
 			})
+		}
+	}()
+
+	go func() {
+		logger.Info("http/3 server listening", logging.Fields{"addr": cfg.HTTPSListen})
+		if err := http3Server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("http/3 server error", logging.Fields{"error": err.Error()})
 		}
 	}()
 

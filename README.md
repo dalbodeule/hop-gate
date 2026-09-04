@@ -18,8 +18,8 @@ HopGate is a gateway that provides a **TLS + yamux HTTP tunnel** between a publi
 - 로그는 JSON 구조 형태로 stdout 에 출력되며, Prometheus + Loki + Grafana 스택에 친화적으로 설계되었습니다.
   Logs are JSON-structured and designed to work well with a Prometheus + Loki + Grafana stack.
 
-> 참고: 현재 yamux logical stream은 HTTP/1.1 wire format을 사용하며, 큰 body는 향후 `io.Pipe` 기반 streaming으로 개선할 예정입니다. (ko)
-> Note: yamux logical streams currently use HTTP/1.1 wire format; large bodies will be improved with `io.Pipe`-based streaming. (en)
+> 참고: yamux logical stream은 HTTP/1.1 wire format을 사용하지만, 요청과 응답 body는 버퍼 전체를 메모리에 올리지 않고 스트리밍됩니다. SSE는 연결이 유지되는 동안 이벤트를 즉시 전달합니다. (ko)
+> Note: yamux logical streams use HTTP/1.1 wire format, while request and response bodies are streamed without buffering the entire payload in memory. SSE events are delivered while the connection remains open. (en)
 
 아키텍처 세부 내용은 [`ARCHITECTURE.md`](ARCHITECTURE.md)에 정리되어 있습니다.  
 Detailed architecture is documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).
@@ -41,8 +41,8 @@ Detailed architecture is documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ### 3.1 의존성 (Dependencies)
 
-- Go 1.21+ 권장 (go.mod 상 버전보다 최신 Go 사용을 추천)
-  Go 1.21+ is recommended (even if go.mod specifies an older minor).
+- Go 1.27.0+ 필요
+  Go 1.27.0 or newer is required.
 - PostgreSQL (관리 Plane + 실제 DomainValidator 에 필수)
   PostgreSQL (required for the admin plane and the real DomainValidator).
 
@@ -169,6 +169,17 @@ HOP_CLIENT_DEBUG=true
 ./bin/hop-gate-client
 ```
 
+HTTP/3 ingress를 사용하려면 서버의 TCP HTTPS 포트와 동일한 UDP 포트를 외부에 노출해야 합니다.
+HTTP/3 ingress requires exposing the same port as the HTTPS listener over UDP.
+
+HTTP/2 Extended CONNECT를 사용하는 클라이언트가 있는 경우 Go HTTP/2의
+호환성 설정을 켜고 서버를 실행합니다.
+For HTTP/2 Extended CONNECT clients, enable Go's compatibility setting:
+
+```bash
+GODEBUG=http2xconnect=1 ./bin/hop-gate-server
+```
+
 성공 시 로그에는 다음과 같은 정보가 찍힙니다.  
 On success, logs will include information like:
 
@@ -210,8 +221,37 @@ For implementation skeleton, see [`internal/admin`](internal/admin) and [`ent/sc
 
 - `Debug=true` 설정은 **개발/테스트 용도**입니다. self-signed 인증서 및 InsecureSkipVerify 사용은 프로덕션 환경에서 절대 사용하지 마세요.
   `Debug=true` is strictly for development/testing. Do not use self-signed certs or InsecureSkipVerify in production.
-- 현재 yamux 경로는 HTTP/1.1·HTTP/2 공개 요청을 처리하지만, WebSocket raw upgrade와 HTTP/3 ingress는 아직 구현 대상입니다.
-  The yamux path handles public HTTP/1.1 and HTTP/2 requests; WebSocket raw upgrade and HTTP/3 ingress remain future work.
+- 현재 yamux 경로는 HTTP/1.1·HTTP/2·HTTP/3 공개 요청, SSE, HTTP/1.1 WebSocket raw upgrade와 HTTP/2·HTTP/3 Extended CONNECT를 처리합니다.
+  The yamux path handles public HTTP/1.1, HTTP/2, and HTTP/3 requests, SSE, HTTP/1.1 WebSocket raw upgrade, and HTTP/2 and HTTP/3 Extended CONNECT.
+
+### Supported Ingress Protocols
+
+| Ingress | 일반 HTTP | SSE | WebSocket 방식 |
+| --- | --- | --- | --- |
+| HTTP/1.1 | 지원 | 지원 | HTTP/1.1 Upgrade |
+| HTTP/2 | 지원 | 지원 | Extended CONNECT |
+| HTTP/3 | 지원 | 지원 | Extended CONNECT |
+
+모든 ingress는 동일한 TLS + yamux 터널을 통해 클라이언트의 로컬 HTTP 서비스로 전달됩니다.
+All ingress protocols use the same TLS + yamux tunnel to reach the client's local HTTP service.
+
+### SSE and Extended CONNECT WebSocket
+
+SSE responses are streamed through the yamux stream and do not use the normal
+proxy timeout when the request accepts `text/event-stream`. This policy applies
+to HTTP/1.1, HTTP/2, and HTTP/3 ingress alike; the client is responsible for
+closing the request context when the SSE connection should end.
+
+HTTP/2 WebSocket Extended CONNECT is enabled by the Go HTTP/2 implementation
+with the following process setting:
+
+```bash
+GODEBUG=http2xconnect=1 go run ./cmd/server
+```
+
+The Extended CONNECT path translates the HTTP/2 or HTTP/3 WebSocket handshake
+to the existing local HTTP/1.1 WebSocket connector, then relays the
+bidirectional stream through yamux.
 
 HopGate는 아직 초기 단계의 실험적 프로젝트입니다. API 및 동작은 언제든지 변경될 수 있습니다.
 HopGate is still experimental; APIs and behavior may change at any time.
