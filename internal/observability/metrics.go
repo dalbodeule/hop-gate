@@ -8,15 +8,6 @@ import (
 // Prometheus 기본 네임스페이스를 사용하며, 메트릭 이름에 hopgate_ 접두어를 붙입니다.
 
 var (
-	// DTLS 핸드셰이크 총 횟수 (성공/실패 라벨 포함).
-	DTLSHandshakesTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "hopgate_dtls_handshakes_total",
-			Help: "Total number of DTLS handshakes, labeled by result.",
-		},
-		[]string{"result"}, // success, failure
-	)
-
 	// HTTP/Proxy 엔드포인트를 통해 들어온 요청 수 (메서드/상태 코드 라벨 포함).
 	HTTPRequestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -42,7 +33,7 @@ var (
 			Name: "hopgate_proxy_errors_total",
 			Help: "Total number of proxy-related errors, labeled by error type.",
 		},
-		[]string{"type"}, // e.g. no_dtls_session, dtls_forward_failed, acme_http01_error
+		[]string{"type"}, // e.g. no_tunnel_session, tunnel_forward_failed, acme_http01_error
 	)
 )
 
@@ -50,7 +41,6 @@ var (
 // 서버 시작 시 한 번만 호출해야 합니다.
 func MustRegister() {
 	prometheus.MustRegister(
-		DTLSHandshakesTotal,
 		HTTPRequestsTotal,
 		HTTPRequestDurationSeconds,
 		ProxyErrorsTotal,

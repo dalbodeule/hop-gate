@@ -30,7 +30,7 @@ type LokiConfig struct {
 type ServerConfig struct {
 	HTTPListen   string   // 예: ":80"
 	HTTPSListen  string   // 예: ":443"
-	DTLSListen   string   // 예: ":443"
+	TunnelListen string   // TLS + yamux tunnel listener, 예: ":7443"
 	Domain       string   // 메인 도메인
 	ProxyDomains []string // 프록시 서브도메인 또는 별도 도메인
 	Debug        bool     // true 이면 디버그 모드 (예: self-signed 인증서 신뢰, 검증 스킵 등)
@@ -40,7 +40,7 @@ type ServerConfig struct {
 
 // ClientConfig 는 클라이언트 프로세스 설정을 담습니다.
 // 현재 클라이언트는 다음 4가지 설정만 사용합니다.
-//   - ServerAddr   : DTLS 서버 주소 (host:port)
+//   - ServerAddr   : 터널 서버 주소 (host:port)
 //   - Domain       : 서버에서 등록된 도메인 (예: api.example.com)
 //   - ClientAPIKey : 도메인에 매핑된 64자 클라이언트 API Key
 //   - LocalTarget  : 로컬에서 요청할 서버 주소 (예: 127.0.0.1:8080)
@@ -48,7 +48,7 @@ type ServerConfig struct {
 // 값은 .env/환경변수와 CLI 인자를 조합해 구성하며,
 // CLI 인자가 우선, env 가 후순위로 적용됩니다.
 type ClientConfig struct {
-	ServerAddr   string // DTLS 서버 주소 (host:port)
+	ServerAddr   string // 터널 서버 주소 (host:port)
 	Domain       string // 서버에서 등록된 도메인 (예: api.example.com)
 	ClientAPIKey string // 도메인에 매핑된 64자 클라이언트 API Key
 	LocalTarget  string // 로컬에서 요청할 서버 주소 (예: 127.0.0.1:8080)
@@ -224,7 +224,7 @@ func LoadServerConfigFromEnv() (*ServerConfig, error) {
 	cfg := &ServerConfig{
 		HTTPListen:   getEnvOrDefault("HOP_SERVER_HTTP_LISTEN", ":80"),
 		HTTPSListen:  getEnvOrDefault("HOP_SERVER_HTTPS_LISTEN", ":443"),
-		DTLSListen:   getEnvOrDefault("HOP_SERVER_DTLS_LISTEN", ":443"),
+		TunnelListen: getEnvOrDefault("HOP_SERVER_TUNNEL_LISTEN", ":7443"),
 		Domain:       os.Getenv("HOP_SERVER_DOMAIN"),
 		ProxyDomains: parseCSVEnv("HOP_SERVER_PROXY_DOMAINS"),
 		Debug:        getEnvBool("HOP_SERVER_DEBUG", false),

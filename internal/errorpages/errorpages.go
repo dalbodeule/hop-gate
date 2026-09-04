@@ -10,8 +10,8 @@ import (
 )
 
 // StatusTLSHandshakeFailed is an HTTP-style status code representing
-// a TLS/DTLS handshake failure (similar to Cloudflare 525).
-// TLS/DTLS 핸드셰이크 실패를 나타내는 HTTP 스타일 상태 코드입니다. (예: 525)
+// a TLS tunnel handshake failure (similar to Cloudflare 525).
+// TLS 터널 핸드셰이크 실패를 나타내는 HTTP 스타일 상태 코드입니다. (예: 525)
 const StatusTLSHandshakeFailed = 525
 
 // StatusGatewayTimeout is an HTTP-style status code representing

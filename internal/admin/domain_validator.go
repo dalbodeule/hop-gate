@@ -8,8 +8,8 @@ import (
 
 	"github.com/dalbodeule/hop-gate/ent"
 	entdomain "github.com/dalbodeule/hop-gate/ent/domain"
-	"github.com/dalbodeule/hop-gate/internal/dtls"
 	"github.com/dalbodeule/hop-gate/internal/logging"
+	"github.com/dalbodeule/hop-gate/internal/tunnel"
 )
 
 // entDomainValidator 는 ent.Client 를 사용해 Domain 테이블에서
@@ -22,7 +22,7 @@ type entDomainValidator struct {
 // NewEntDomainValidator 는 ent 기반 DomainValidator 를 생성합니다.
 //   - domain 파라미터는 "host" 또는 "host:port" 형태 모두 허용하며,
 //     DB 조회 시에는 host 부분만 사용합니다.
-func NewEntDomainValidator(logger logging.Logger, client *ent.Client) dtls.DomainValidator {
+func NewEntDomainValidator(logger logging.Logger, client *ent.Client) tunnel.DomainValidator {
 	return &entDomainValidator{
 		logger: logger.With(logging.Fields{"component": "domain_validator"}),
 		client: client,

@@ -19,7 +19,7 @@
     "build:errors-css": "tailwindcss -c ./tools/tailwind/tailwind.config.cjs -i ./tools/tailwind/input.css -o ./internal/errorpages/assets/errors.css --minify"
   },
   "devDependencies": {
-    "@tailwindcss/cli": "^4.1.17",
-    "tailwindcss": "^4.1.17"
+    "@tailwindcss/cli": "^4.3.3",
+    "tailwindcss": "^4.3.3"
   }
 }
