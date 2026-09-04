@@ -29,8 +29,8 @@ import (
 // Manager 는 ACME 기반 인증서 관리를 추상화합니다. (ko)
 // Manager abstracts ACME-based certificate management. (en)
 type Manager interface {
-	// TLSConfig 는 HTTPS 및 DTLS 서버에 주입할 tls.Config 를 반환합니다. (ko)
-	// TLSConfig returns a tls.Config to be used by HTTPS and DTLS servers. (en)
+	// TLSConfig 는 HTTPS 및 TLS 터널 listener에 주입할 tls.Config 를 반환합니다. (ko)
+	// TLSConfig returns a tls.Config for the HTTPS and TLS tunnel listeners. (en)
 	TLSConfig() *tls.Config
 }
 

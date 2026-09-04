@@ -4,22 +4,22 @@
 
 ## 1. 프로젝트 개요 (Project Overview)
 
-HopGate는 공인 서버와 여러 프라이빗 네트워크 클라이언트 사이에 **DTLS 기반 HTTP 터널**을 제공하는 게이트웨이입니다.
-HopGate is a gateway that provides a **DTLS-based HTTP tunnel** between a public server and multiple private-network clients.
+HopGate는 공인 서버와 여러 프라이빗 네트워크 클라이언트 사이에 **TLS + yamux 기반 HTTP 터널**을 제공하는 게이트웨이입니다.
+HopGate is a gateway that provides a **TLS + yamux HTTP tunnel** between a public server and multiple private-network clients.
 
 주요 특징 (Key features):
 
 - 서버는 80/443 포트를 점유하고, ACME(Let's Encrypt 등)로 TLS 인증서를 자동 발급/갱신합니다.
   The server listens on ports 80/443 and automatically issues/renews TLS certificates via ACME (e.g. Let's Encrypt).
-- 서버–클라이언트 간 전송은 DTLS 위에서 이루어지며, 현재는 HTTP 요청/응답을 **Protobuf 기반 length-prefixed Envelope** 로 터널링합니다.
-  Transport between server and clients uses DTLS; HTTP requests/responses are tunneled as **Protobuf-based, length-prefixed envelopes**.
+- 서버–클라이언트 간 기본 전송은 TLS 위의 TCP와 yamux이며, 하나의 연결에 여러 HTTP logical stream을 multiplex합니다.
+  The default transport is TCP + TLS with yamux multiplexing, carrying multiple HTTP logical streams over one connection.
 - 관리 Plane(REST API)을 통해 도메인 등록/해제 및 클라이언트 API Key 발급을 수행합니다.
   An admin management plane (REST API) handles domain registration/unregistration and client API key issuance.
 - 로그는 JSON 구조 형태로 stdout 에 출력되며, Prometheus + Loki + Grafana 스택에 친화적으로 설계되었습니다.
   Logs are JSON-structured and designed to work well with a Prometheus + Loki + Grafana stack.
 
-> 참고: 대용량 HTTP 바디에 대해서는 DTLS/UDP MTU 한계 때문에 **단일 Envelope** 로는 한계가 있으므로, `progress.md` 의 3.3A 섹션에 정리된 것처럼 `StreamOpen` / `StreamData` / `StreamClose` 기반의 스트림/프레임 터널링으로 점진적으로 전환할 예정입니다. (ko)
-> Note: For very large HTTP bodies, a single-envelope model still hits DTLS/UDP MTU limits. As outlined in section 3.3A of `progress.md`, the plan is to gradually move to a stream/frame-based tunneling model using `StreamOpen` / `StreamData` / `StreamClose`. (en)
+> 참고: 현재 yamux logical stream은 HTTP/1.1 wire format을 사용하며, 큰 body는 향후 `io.Pipe` 기반 streaming으로 개선할 예정입니다. (ko)
+> Note: yamux logical streams currently use HTTP/1.1 wire format; large bodies will be improved with `io.Pipe`-based streaming. (en)
 
 아키텍처 세부 내용은 [`ARCHITECTURE.md`](ARCHITECTURE.md)에 정리되어 있습니다.  
 Detailed architecture is documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).
@@ -31,7 +31,7 @@ Detailed architecture is documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 - 서버 엔트리 (Server entrypoint): [`cmd/server/main.go`](cmd/server/main.go)  
 - 클라이언트 엔트리 (Client entrypoint): [`cmd/client/main.go`](cmd/client/main.go)
 - 설정 로더 (Config loader): [`internal/config/config.go`](internal/config/config.go)
-- DTLS 추상/구현 (DTLS abstraction & implementation): [`internal/dtls`](internal/dtls)
+- TLS + yamux 터널 (TLS + yamux tunnel): [`internal/tunnel`](internal/tunnel)
 - 관리 Plane (Admin plane HTTP API): [`internal/admin`](internal/admin)
 - 도메인 스키마 (Domain schema, ent): [`ent/schema/domain.go`](ent/schema/domain.go)
 
@@ -106,7 +106,7 @@ Required environment variables are validated in two stages:
 
 2. **실행 단계 (Runtime) – 엔트리포인트에서 엄격 검증 (strict runtime validation)**
    - 서버: [`cmd/server/main.go`](cmd/server/main.go)
-     - 헬퍼 `getEnvOrPanic(logger, key)` 를 사용해 `HOP_SERVER_HTTP_LISTEN`, `HOP_SERVER_HTTPS_LISTEN`, `HOP_SERVER_DTLS_LISTEN`, `HOP_SERVER_DOMAIN`, `HOP_SERVER_DEBUG` 가 비어 있지 않은지 확인합니다.
+     - 헬퍼 `getEnvOrPanic(logger, key)` 를 사용해 `HOP_SERVER_HTTP_LISTEN`, `HOP_SERVER_HTTPS_LISTEN`, `HOP_SERVER_DOMAIN`, `HOP_SERVER_DEBUG` 가 비어 있지 않은지 확인합니다.
      - 누락되었거나 공백인 경우, 구조화 에러 로그(JSON)와 함께 프로세스를 종료합니다.
    - 클라이언트: [`cmd/client/main.go`](cmd/client/main.go)
      - `HOP_CLIENT_SERVER_ADDR`, `HOP_CLIENT_DOMAIN`, `HOP_CLIENT_API_KEY`, `HOP_CLIENT_LOCAL_TARGET`, `HOP_CLIENT_DEBUG` 를 동일한 방식으로 검증합니다.
@@ -117,41 +117,41 @@ Required environment variables are validated in two stages:
 로컬 개발에서는 `.env.example` 을 복사한 `.env` 파일을 사용해 빠르게 설정을 구성할 수 있습니다.
 For production deployments, prefer OS-level env (Kubernetes `env`, Docker `-e`, systemd `Environment=`, etc.), and use a local `.env` (copied from `.env.example`) mainly for development.
 
-## 4. DTLS 핸드셰이크 테스트 (Testing DTLS Handshake)
+## 4. TLS + yamux 터널 설정 (TLS + yamux tunnel configuration)
 
-HopGate는 DTLS 위에서 **도메인 + 클라이언트 API Key** 기반의 애플리케이션 레벨 핸드셰이크를 수행합니다.  
-HopGate performs an application-level handshake over DTLS using **domain + client API key**.
+HopGate는 TLS 연결 위의 yamux control stream에서 **도메인 + 클라이언트 API Key** 기반의 핸드셰이크를 수행합니다.
+HopGate authenticates a yamux control stream using **domain + client API key**.
 
 ### 4.1 서버 설정 예시 (Server .env example)
 
 `.env`:
 
 ```env
-HOP_SERVER_DTLS_LISTEN=:8443
+HOP_SERVER_TUNNEL_LISTEN=:7443
 HOP_SERVER_DEBUG=true
 ```
 
-- `HOP_SERVER_DTLS_LISTEN`  
-  DTLS 서버가 바인딩할 UDP 포트입니다. 예: `:8443`  
-  UDP port for the DTLS server to bind on, e.g. `:8443`.
+- `HOP_SERVER_TUNNEL_LISTEN`
+  TLS + yamux 서버가 바인딩할 TCP 포트입니다. 예: `:7443`
+  TCP port for the TLS + yamux server to bind on, e.g. `:7443`.
 - `HOP_SERVER_DEBUG=true`  
-  디버그 모드에서는 [`dtls.NewSelfSignedLocalhostConfig()`](internal/dtls/selfsigned.go) 를 사용해 self-signed localhost 인증서를 생성합니다.  
-  In debug mode the server uses [`dtls.NewSelfSignedLocalhostConfig()`](internal/dtls/selfsigned.go) to generate a self-signed localhost certificate.
+  디버그 모드에서는 인증서 검증을 생략할 수 있습니다. 이는 개발 환경에서만 사용해야 합니다.
+  In debug mode certificate verification may be skipped. Use this only for development.
 
 ### 4.2 클라이언트 설정 예시 (Client .env example)
 
 `.env`:
 
 ```env
-HOP_CLIENT_SERVER_ADDR=localhost:8443
+HOP_CLIENT_SERVER_ADDR=localhost:7443
 HOP_CLIENT_DOMAIN=test.example.com
 HOP_CLIENT_API_KEY=TEST_LOCALHOST_API_KEY_0123456789_ABCDEFGHIJKLMNOPQRSTUVWXYZ
 HOP_CLIENT_LOCAL_TARGET=127.0.0.1:8080
 HOP_CLIENT_DEBUG=true
 ```
 
-- `HOP_CLIENT_SERVER_ADDR` : DTLS 서버 주소 (예: `localhost:8443`)
-  DTLS server address, e.g. `localhost:8443`.
+- `HOP_CLIENT_SERVER_ADDR` : yamux 터널 서버 주소 (예: `localhost:7443`)
+  yamux tunnel server address, e.g. `localhost:7443`.
 - `HOP_CLIENT_DOMAIN` / `HOP_CLIENT_API_KEY` : 관리 Plane 에서 발급받은 도메인/키 (실제 ent + PostgreSQL 기반 DomainValidator 에 의해 검증)
   Domain and API key issued by the admin plane (validated by a real ent + PostgreSQL based DomainValidator).
 - `HOP_CLIENT_LOCAL_TARGET` : 실제로 HTTP 요청을 보낼 로컬 서버 주소
@@ -210,12 +210,8 @@ For implementation skeleton, see [`internal/admin`](internal/admin) and [`ent/sc
 
 - `Debug=true` 설정은 **개발/테스트 용도**입니다. self-signed 인증서 및 InsecureSkipVerify 사용은 프로덕션 환경에서 절대 사용하지 마세요.
   `Debug=true` is strictly for development/testing. Do not use self-signed certs or InsecureSkipVerify in production.
-- 현재 버전은 ACME 기반 인증서, PostgreSQL + ent 기반 DomainValidator, Proxy 레이어가 기본적으로 연동되어 있으나,
-  대용량 HTTP 바디에 대해서는 JSON 단일 메시지 기반 터널링 특성상 DTLS/UDP MTU 한계에 부딪힐 수 있습니다.
-  스트림/프레임 기반 DTLS 터널링으로의 전환 및 하드닝 작업은 `progress.md` 에 정의된 다음 단계에 포함되어 있습니다. (ko)
-  The current version wires ACME certificates, a PostgreSQL+ent-based DomainValidator, and the proxy layer by default,
-  but for very large HTTP bodies the JSON single-message tunneling model can still hit DTLS/UDP MTU limits.
-  Moving to a stream/frame-based DTLS tunneling model and further hardening are tracked as next steps in `progress.md`. (en)
+- 현재 yamux 경로는 HTTP/1.1·HTTP/2 공개 요청을 처리하지만, WebSocket raw upgrade와 HTTP/3 ingress는 아직 구현 대상입니다.
+  The yamux path handles public HTTP/1.1 and HTTP/2 requests; WebSocket raw upgrade and HTTP/3 ingress remain future work.
 
 HopGate는 아직 초기 단계의 실험적 프로젝트입니다. API 및 동작은 언제든지 변경될 수 있습니다.
 HopGate is still experimental; APIs and behavior may change at any time.

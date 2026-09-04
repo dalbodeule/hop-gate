@@ -6,11 +6,9 @@ require (
 	entgo.io/ent v0.14.5
 	github.com/go-acme/lego/v4 v4.28.1
 	github.com/google/uuid v1.6.0
+	github.com/hashicorp/yamux v0.1.2
 	github.com/lib/pq v1.10.9
 	github.com/prometheus/client_golang v1.19.0
-	golang.org/x/net v0.47.0
-	google.golang.org/grpc v1.76.0
-	google.golang.org/protobuf v1.36.10
 )
 
 require (
@@ -35,9 +33,10 @@ require (
 	github.com/zclconf/go-cty-yaml v1.1.0 // indirect
 	golang.org/x/crypto v0.45.0 // indirect
 	golang.org/x/mod v0.29.0 // indirect
+	golang.org/x/net v0.47.0 // indirect
 	golang.org/x/sync v0.18.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.31.0 // indirect
 	golang.org/x/tools v0.38.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20251022142026-3a174f9686a8 // indirect
+	google.golang.org/protobuf v1.36.10 // indirect
 )

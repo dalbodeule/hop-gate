@@ -75,7 +75,6 @@ docker-server:
 check-env-server:
 	@if [ -z "$$HOP_SERVER_HTTP_LISTEN" ]; then echo "필수 환경 변수 HOP_SERVER_HTTP_LISTEN이 설정되지 않았습니다."; exit 1; fi
 	@if [ -z "$$HOP_SERVER_HTTPS_LISTEN" ]; then echo "필수 환경 변수 HOP_SERVER_HTTPS_LISTEN가 설정되지 않았습니다."; exit 1; fi
-	@if [ -z "$$HOP_SERVER_DTLS_LISTEN" ]; then echo "필수 환경 변수 HOP_SERVER_DTLS_LISTEN가 설정되지 않았습니다."; exit 1; fi
 	@if [ -z "$$HOP_SERVER_DOMAIN" ]; then echo "필수 환경 변수 HOP_SERVER_DOMAIN가 설정되지 않았습니다."; exit 1; fi
 
 check-env-client:
@@ -84,22 +83,3 @@ check-env-client:
 	@if [ -z "$$HOP_CLIENT_API_KEY" ]; then echo "필수 환경 변수 HOP_CLIENT_API_KEY가 설정되지 않았습니다."; exit 1; fi
 	@if [ -z "$$HOP_CLIENT_LOCAL_TARGET" ]; then echo "필수 환경 변수 HOP_CLIENT_LOCAL_TARGET가 설정되지 않았습니다."; exit 1; fi
 	@if [ -z "$$HOP_CLIENT_DEBUG" ]; then echo "필수 환경 변수 HOP_CLIENT_DEBUG가 설정되지 않았습니다."; exit 1; fi
-
-# --- Protobuf code generation -------------------------------------------------
-# Requires:
-#   - protoc (https://grpc.io/docs/protoc-installation/)
-#   - protoc-gen-go (go install google.golang.org/protobuf/cmd/protoc-gen-go@latest)
-#
-# Generates Go types under internal/protocol/pb from internal/protocol/hopgate_stream.proto.
-# NOTE:
-#   - go_package in hopgate_stream.proto is set to:
-#       github.com/dalbodeule/hop-gate/internal/protocol/pb;protocolpb
-#   - With --go_out=. (without paths=source_relative), protoc will place the
-#     generated file under internal/protocol/pb according to go_package.
-proto:
-	@echo "Generating Go code from Protobuf schemas..."
-	protoc \
-		--go_out=. \
-		internal/protocol/hopgate_stream.proto
-	@echo "Protobuf generation completed."
-
